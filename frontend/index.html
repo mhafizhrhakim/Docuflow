@@ -1,0 +1,576 @@
+
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f4f7fc" />
+    <meta
+      name="description"
+      content="DocuFlow — ruang kerja ekstraksi dokumen lokal."
+    />
+    <link rel="icon" type="image/png" href="/assets/docuflow-logo-icon.png" />
+    <title>DocuFlow — Document Extraction</title>
+  </head>
+
+  <body>
+    <div class="app-shell">
+      <!-- Header -->
+      <header class="app-header">
+        <div class="brand-block">
+          <img class="brand-mark" src="/assets/docuflow-logo-icon.png" alt="" aria-hidden="true" />
+          <div class="brand-copy">
+            <div class="brand-name">DocuFlow</div>
+            <div class="brand-caption">DOCUMENT EXTRACTION</div>
+          </div>
+        </div>
+
+        <div class="document-identity">
+          <div class="document-icon" aria-hidden="true">▤</div>
+          <div class="document-copy">
+            <strong id="document-name">Belum ada dokumen</strong>
+            <span id="document-meta">
+              Pilih PDF untuk memulai · file diproses lokal
+            </span>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <button
+            id="choose-pdf-button"
+            class="button button-primary"
+            type="button"
+          >
+            ＋ Pilih PDF
+          </button>
+
+          <button
+            id="replace-document-button"
+            class="button button-secondary"
+            type="button"
+          >
+            ▤ Ganti dokumen
+          </button>
+
+          <input
+            id="pdf-input"
+            type="file"
+            accept="application/pdf,.pdf"
+            multiple
+            hidden
+          />
+        </div>
+      </header>
+
+      <main class="main-content">
+        <!-- Workflow navigation -->
+        <div class="workflow-bar">
+          <div class="workflow-tabs" role="group" aria-label="Mode analisis">
+            <button
+              class="workflow-tab active"
+              data-mode="single"
+              type="button"
+              aria-pressed="true"
+            >
+              Single PDF
+            </button>
+
+            <button
+              class="workflow-tab"
+              data-mode="multi"
+              type="button"
+              aria-pressed="false"
+            >
+              Multi-document
+            </button>
+          </div>
+
+          <span class="workspace-note">
+            Pemrosesan lokal · hasil ekstraksi ditampilkan per halaman
+            dan per dokumen
+          </span>
+        </div>
+
+        <!-- Single PDF workflow -->
+        <section id="single-workflow" aria-label="Workflow Single PDF">
+          <!-- Page classification -->
+          <section
+            class="page-classification panel"
+            aria-label="Navigasi dan klasifikasi halaman"
+          >
+            <div class="classification-heading">
+              <strong>Jenis konten per halaman</strong>
+              <span
+                id="classification-status"
+                class="status-pill status-pending"
+              >
+                Klasifikasi belum dijalankan
+              </span>
+            </div>
+
+            <div id="single-progress" class="multi-overall-progress single-progress" hidden role="status" aria-live="polite">
+              <div class="multi-overall-progress-copy">
+                <span class="multi-progress-spinner" aria-hidden="true"></span>
+                <strong id="single-progress-phase">Menunggu</strong>
+                <span id="single-progress-percent" class="multi-progress-percent">—</span>
+              </div>
+              <progress id="single-progress-bar" class="multi-progress-bar" max="100" value="0" aria-label="Progres analisis PDF"></progress>
+            </div>
+
+            <div class="page-navigation-controls">
+              <div class="page-navigation-shortcuts" role="group" aria-label="Navigasi halaman dokumen">
+                <button id="page-home-button" class="page-shortcut-button" type="button" disabled aria-label="Ke halaman pertama">Home</button>
+                <button id="page-previous-button" class="page-shortcut-button page-shortcut-arrow" type="button" disabled aria-label="Halaman sebelumnya" title="Halaman sebelumnya">←</button>
+                <button id="page-next-button" class="page-shortcut-button page-shortcut-arrow" type="button" disabled aria-label="Halaman berikutnya" title="Halaman berikutnya">→</button>
+                <button id="page-end-button" class="page-shortcut-button" type="button" disabled aria-label="Ke halaman terakhir">End</button>
+              </div>
+              <div id="page-chips" class="page-chips" aria-label="Pilih halaman PDF">
+                <span class="page-chip-placeholder">
+                  Nomor halaman akan muncul setelah PDF dipilih
+                </span>
+              </div>
+            </div>
+
+            <div class="classification-legend" aria-label="Legenda klasifikasi">
+              <span>
+                <i class="legend-dot dot-digital"></i>
+                Invoice digital <b id="digital-count">—</b>
+              </span>
+
+              <span>
+                <i class="legend-dot dot-scan"></i>
+                Invoice scan <b id="scan-count">—</b>
+              </span>
+
+              <span>
+                <i class="legend-dot dot-other"></i>
+                Email / dokumen lain <b id="other-count">—</b>
+              </span>
+            </div>
+          </section>
+
+          <!-- Independent PDF preview panels -->
+          <section class="preview-grid" aria-label="Pratinjau halaman">
+            <!-- Digital/text PDF panel -->
+            <article class="panel preview-card digital-card">
+              <div class="card-heading">
+                <div class="heading-icon digital-icon" aria-hidden="true">
+                  ▤
+                </div>
+
+                <div class="heading-copy">
+                  <h2>Pratinjau PDF digital</h2>
+                  <p id="digital-subtitle">Menunggu dokumen</p>
+                </div>
+
+                <div class="card-metrics">
+                  <span
+                    class="category-badge digital-badge"
+                    id="digital-page-badge"
+                  >
+                    Belum diklasifikasi
+                  </span>
+                  <small id="digital-item-count">
+                    Ekstraksi belum dijalankan
+                  </small>
+                </div>
+              </div>
+
+              <div class="viewer-toolbar">
+                <button
+                  id="pdf-prev"
+                  class="toolbar-button"
+                  type="button"
+                  disabled
+                  aria-label="Halaman digital sebelumnya"
+                >
+                  ←
+                </button>
+
+                <label class="page-indicator">
+                  <input
+                    id="pdf-page-input"
+                    type="number"
+                    min="1"
+                    value="1"
+                    disabled
+                    aria-label="Nomor halaman digital"
+                  />
+                  <span id="pdf-page-total">/ —</span>
+                </label>
+
+                <button
+                  id="pdf-next"
+                  class="toolbar-button"
+                  type="button"
+                  disabled
+                  aria-label="Halaman digital berikutnya"
+                >
+                  →
+                </button>
+
+                <span class="toolbar-spacer"></span>
+
+                <button
+                  id="pdf-zoom-out"
+                  class="toolbar-button zoom-button"
+                  type="button"
+                  disabled
+                  aria-label="Perkecil preview digital"
+                >
+                  −
+                </button>
+
+                <span id="pdf-zoom-label" class="zoom-label">100%</span>
+
+                <button
+                  id="pdf-zoom-in"
+                  class="toolbar-button zoom-button"
+                  type="button"
+                  disabled
+                  aria-label="Perbesar preview digital"
+                >
+                  +
+                </button>
+
+                <button
+                  id="pdf-fit-button"
+                  class="toolbar-button icon-button"
+                  type="button"
+                  disabled
+                  aria-label="Pas dengan panel digital"
+                  title="Pas dengan panel"
+                >
+                  ⛶
+                </button>
+              </div>
+
+              <div
+                id="pdf-viewer-status"
+                class="viewer-status"
+                role="status"
+                aria-live="polite"
+              >
+                Pilih PDF untuk melihat pratinjau.
+              </div>
+
+              <div id="pdf-viewer-container" class="pdf-viewer-container">
+                <div class="empty-preview" id="digital-empty">
+                  <div class="empty-document-icon">PDF</div>
+                  <strong>Pratinjau halaman digital</strong>
+                  <p>
+                    Halaman yang memiliki teks digital akan dapat ditinjau
+                    di panel ini setelah klasifikasi.
+                  </p>
+                </div>
+
+                <canvas
+                  id="pdf-canvas"
+                  hidden
+                  aria-label="Pratinjau halaman PDF digital"
+                ></canvas>
+              </div>
+            </article>
+
+            <!-- Scanned PDF panel -->
+            <article class="panel preview-card scan-card">
+              <div class="card-heading">
+                <div class="heading-icon scan-icon" aria-hidden="true">
+                  ▧
+                </div>
+
+                <div class="heading-copy">
+                  <h2>Kelompok halaman scan</h2>
+                  <p id="scan-subtitle">Menunggu klasifikasi per halaman</p>
+                </div>
+
+                <div class="card-metrics">
+                  <span
+                    class="category-badge scan-badge"
+                    id="scan-page-badge"
+                  >
+                    Belum diketahui
+                  </span>
+                  <small id="scan-item-count">
+                    Ekstraksi belum dijalankan
+                  </small>
+                </div>
+              </div>
+
+              <div class="viewer-toolbar scan-toolbar">
+                <button
+                  id="scan-pdf-prev"
+                  class="toolbar-button"
+                  type="button"
+                  disabled
+                  aria-label="Halaman scan sebelumnya"
+                >
+                  ←
+                </button>
+
+                <label class="page-indicator">
+                  <input
+                    id="scan-pdf-page-input"
+                    type="number"
+                    min="1"
+                    value="1"
+                    disabled
+                    aria-label="Nomor urutan halaman scan"
+                  />
+                  <span id="scan-pdf-page-total">/ —</span>
+                </label>
+
+                <button
+                  id="scan-pdf-next"
+                  class="toolbar-button"
+                  type="button"
+                  disabled
+                  aria-label="Halaman scan berikutnya"
+                >
+                  →
+                </button>
+
+                <span class="toolbar-spacer"></span>
+
+                <button
+                  id="scan-pdf-zoom-out"
+                  class="toolbar-button zoom-button"
+                  type="button"
+                  disabled
+                  aria-label="Perkecil preview scan"
+                >
+                  −
+                </button>
+
+                <span id="scan-pdf-zoom-label" class="zoom-label">100%</span>
+
+                <button
+                  id="scan-pdf-zoom-in"
+                  class="toolbar-button zoom-button"
+                  type="button"
+                  disabled
+                  aria-label="Perbesar preview scan"
+                >
+                  +
+                </button>
+
+                <button
+                  id="scan-pdf-fit-button"
+                  class="toolbar-button icon-button"
+                  type="button"
+                  disabled
+                  aria-label="Pas dengan panel scan"
+                  title="Pas dengan panel"
+                >
+                  ⛶
+                </button>
+              </div>
+
+              <div
+                id="scan-pdf-viewer-status"
+                class="viewer-status scan-status"
+                role="status"
+                aria-live="polite"
+              >
+                Halaman scan akan tersedia setelah klasifikasi.
+              </div>
+
+              <div
+                id="scan-pdf-viewer-container"
+                class="pdf-viewer-container scan-viewer-container"
+              >
+                <div class="empty-preview" id="scan-empty">
+                  <div class="empty-document-icon scan-empty-icon">▧</div>
+                  <strong>Belum ada halaman scan teridentifikasi</strong>
+                  <p>
+                    Halaman scan akan muncul di sini setelah klasifikasi
+                    per halaman tersedia.
+                  </p>
+                </div>
+
+                <canvas
+                  id="scan-pdf-canvas"
+                  hidden
+                  aria-label="Pratinjau halaman PDF scan"
+                ></canvas>
+              </div>
+            </article>
+          </section>
+
+          <!-- Extraction tables -->
+          <section
+            class="extraction-grid"
+            aria-label="Tabel hasil ekstraksi per kelompok"
+          >
+            <!-- Dynamic digital-page table -->
+            <article class="panel extraction-card">
+              <div class="table-card-heading">
+                <div>
+                  <h2>Tabel ekstraksi — halaman digital aktif</h2>
+                  <p id="digital-table-subtitle">Belum dianalisis</p>
+                </div>
+
+                <div class="table-actions">
+                  <label class="search-box">
+                    <span>⌕</span>
+                    <input
+                      id="digital-search"
+                      type="search"
+                      placeholder="Cari dalam tabel..."
+                      disabled
+                    />
+                  </label>
+
+                  <button
+                    id="digital-copy-button"
+                    class="button button-small"
+                    type="button"
+                    disabled
+                  >
+                    ▢ Salin
+                  </button>
+
+                  <button
+                    id="digital-export-button"
+                    class="button button-small"
+                    type="button"
+                    disabled
+                  >
+                    ⇩ Ekspor
+                  </button>
+                </div>
+              </div>
+
+              <div id="digital-table-container" class="data-table-wrap">
+                <div class="extraction-empty-state" role="status">
+                  Hasil ekstraksi akan muncul setelah analisis dijalankan.
+                </div>
+              </div>
+
+              <div
+                class="table-footnote"
+                id="digital-table-footer"
+              >
+                Nilai dan struktur tabel sumber akan dipertahankan.
+              </div>
+            </article>
+
+            <!-- Dynamic scanned-page table -->
+            <article class="panel extraction-card">
+              <div class="table-card-heading">
+                <div>
+                  <h2>Tabel ekstraksi — halaman scan aktif</h2>
+                  <p id="scan-table-subtitle">Belum dianalisis</p>
+                </div>
+
+                <div class="table-actions">
+                  <label class="search-box">
+                    <span>⌕</span>
+                    <input
+                      id="scan-search"
+                      type="search"
+                      placeholder="Cari dalam tabel..."
+                      disabled
+                    />
+                  </label>
+
+                  <button
+                    id="scan-copy-button"
+                    class="button button-small"
+                    type="button"
+                    disabled
+                  >
+                    ▢ Salin
+                  </button>
+
+                  <button
+                    id="scan-export-button"
+                    class="button button-small"
+                    type="button"
+                    disabled
+                  >
+                    ⇩ Ekspor
+                  </button>
+                </div>
+              </div>
+
+              <div id="scan-table-container" class="data-table-wrap">
+                <div class="extraction-empty-state" role="status">
+                  Halaman scan menunggu OCR.
+                </div>
+              </div>
+
+              <div
+                class="table-footnote"
+                id="scan-table-footer"
+              >
+                Hasil scan belum diekstrak karena OCR belum dijalankan.
+              </div>
+            </article>
+          </section>
+        </section>
+
+        <!-- Multi-document workflow -->
+        <section
+          id="multi-workflow"
+          hidden
+          aria-label="Workflow Multi-document"
+        >
+          <section class="multi-intro panel">
+            <div>
+              <h1>Multi-document</h1>
+              <p>
+                Setiap PDF memiliki preview, navigasi halaman, dan tabel
+                ekstraksi sendiri. Hasil gabungan tersedia sebagai CSV terpisah.
+              </p>
+            </div>
+
+            <span
+              class="status-pill status-pending"
+              id="multi-status"
+            >
+              Belum ada dokumen
+            </span>
+            <div class="multi-overall-progress" id="multi-overall-progress" hidden>
+              <div class="multi-overall-progress-copy">
+                <span class="multi-progress-spinner" aria-hidden="true"></span>
+                <strong id="multi-overall-progress-label">Menunggu dokumen</strong>
+              </div>
+              <progress id="multi-overall-progress-bar" max="100" value="0" aria-label="Progres seluruh dokumen"></progress>
+            </div>
+            <button id="multi-export-button" class="button button-secondary" type="button" disabled>
+              ⇩ Unduh hasil gabungan CSV
+            </button>
+          </section>
+
+          <div id="multi-empty" class="panel multi-empty">
+            <div class="empty-document-icon">PDF</div>
+            <strong>Pilih beberapa PDF untuk memulai</strong>
+            <p>Jumlah kartu mengikuti jumlah dokumen yang dipilih.</p>
+          </div>
+
+          <section
+            id="multi-document-grid"
+            class="multi-document-grid"
+            aria-label="Kartu dokumen"
+          ></section>
+        </section>
+
+        <!-- Footer -->
+        <footer class="page-footer">
+          <span>
+            DocuFlow · Document Extraction Workspace · Local-first
+          </span>
+
+          <span class="api-status-wrap">
+            <i class="status-dot"></i>
+            <span id="api-status">Memeriksa backend…</span>
+            <span id="api-detail"></span>
+          </span>
+        </footer>
+      </main>
+    </div>
+
+    <script type="module" src="/src/js/app.js"></script>
+  </body>
+</html>

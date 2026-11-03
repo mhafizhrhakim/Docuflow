@@ -1,0 +1,84 @@
+# Node
+node_modules/
+dist/
+frontend/dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv_rapidocr/
+.venv_paddleocr/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage/
+htmlcov/
+
+# User-provided evaluation PDFs and generated OCR content may contain
+# confidential document data. Keep the samples README tracked.
+samples/real_documents/
+samples/**/*.pdf
+ocr-pilot-output/
+benchmark-results/
+
+# Local development context and archived snapshots; keep the active launcher.
+/ocr_backend_context.txt
+/scripts/backend/
+/scripts/frontend/
+/scripts/docs/
+/scripts/tests/
+/scripts/tools/
+/scripts/DocuFlow_OCR_Integration_Patch/
+/scripts/DocuFlow_Row_Recovery_Patch/
+/scripts/samples/
+/scripts/scripts/
+/scripts/README.md
+/scripts/.env.example
+/scripts/.gitignore
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+
+# Temporary uploads and generated outputs
+backend/storage/uploads/*
+backend/storage/work/*
+backend/storage/exports/*
+!backend/storage/uploads/.gitkeep
+!backend/storage/work/.gitkeep
+!backend/storage/exports/.gitkeep
+
+# Local scratch files, caches, temporary files, backups, and test reports
+tmp/
+temp/
+.cache/
+cache/
+test-results/
+playwright-report/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# PDF documents may contain customer or company data. Add deliberately with
+# `git add -f` only if a reviewed, non-sensitive fixture is truly required.
+*.pdf
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

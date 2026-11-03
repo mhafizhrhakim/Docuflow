@@ -1,0 +1,19 @@
+{
+  "name": "invoice-audit-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first PDF document audit application",
+  "scripts": {
+    "dev": "concurrently -k -n FRONTEND,BACKEND -c blue,green \"npm:dev:frontend\" \"npm:dev:backend\"",
+    "dev:frontend": "vite --config frontend/vite.config.js",
+    "dev:backend": "node scripts/start-backend.mjs",
+    "build": "vite build --config frontend/vite.config.js"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "vite": "^6.4.1"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^4.10.38"
+  }
+}

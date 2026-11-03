@@ -1,0 +1,8 @@
+# Add these OCR runtime dependencies to the project's deployment dependency set.
+rapidocr==3.10.0
+onnxruntime==1.31.1
+opencv-python-headless>=4.5.1.48
+# RapidTable fallback is imported lazily. Its published wheel depends on
+# opencv-python, which conflicts with RapidOCR's headless OpenCV package.
+# If enabling it in a controlled environment, install rapid-table with
+# --no-deps after this file and backend/requirements.txt have been installed.
