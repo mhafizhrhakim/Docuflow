@@ -27,14 +27,19 @@ app = FastAPI(
         "Local-first API for inspecting PDF pages "
         "in the DocuFlow document extraction workspace."
     ),
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
 )
 
+# The frontend and API normally share one origin behind the deployment proxy.
+# Keep a strict explicit CORS allowlist for approved split-origin deployments.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin],
+    allow_origins=settings.cors_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type"],
 )
 
 app.include_router(health_router, prefix="/api")

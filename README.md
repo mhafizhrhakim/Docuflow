@@ -9,7 +9,7 @@ DocuFlow adalah aplikasi lokal untuk melihat PDF dan mengekstrak tabel agar hasi
 - **Ekstraksi per halaman:** halaman digital memakai teks dan struktur native PDF. Halaman scan diproses dengan RapidOCR lokal; PDF campuran ditangani per halaman.
 - **Pemeriksaan hasil:** hasil tabel mempertahankan sumber dokumen dan nomor halaman jika tersedia. Baris atau sel yang meragukan dapat ditandai untuk ditinjau.
 - **Pencarian dan salin:** pencarian tabel, pemilihan baris, salin baris terpilih, dan salin seluruh tabel dalam format TSV.
-- **Ekspor:** tabel dapat diunduh sebagai CSV.
+- **Ekspor:** tabel dapat diunduh sebagai CSV atau Excel (.xlsx).
 - **Preview PDF:** PDF.js menampilkan dokumen di browser, dengan navigasi halaman dan kontrol zoom.
 
 Ekstraksi tidak menjamin semua format PDF terbaca sempurna. Periksa hasil dan penanda tinjauan terhadap sumber dokumen, terutama pada PDF scan.
@@ -50,40 +50,33 @@ npm run dev
 
 `npm run dev` menjalankan Vite dan Uvicorn secara bersamaan. Aktifkan `.venv` sebelum menjalankannya agar perintah `python` memakai environment backend.
 
-## Menjalankan pada server internal
+## Demo sementara melalui Ngrok
 
-Bangun frontend dan jalankan backend tanpa mode reload. Konfigurasikan `.env` pada server dengan alamat frontend yang sebenarnya; jangan gunakan `FRONTEND_ORIGIN` lokal pada deployment.
-
-```env
-APP_ENV=production
-APP_HOST=0.0.0.0
-APP_PORT=8000
-FRONTEND_ORIGIN=https://docuflow.internal.example
-MAX_UPLOAD_MB=50
-INSPECTION_WORKERS=2
-INSPECTION_QUEUE_SLOTS=2
-OCR_INTRA_OP_THREADS=2
-```
+Selama server perusahaan belum tersedia, DocuFlow dapat dibuka sementara dari laptop developer:
 
 ```powershell
-npm run build
-node scripts/start-backend.mjs
+docker compose up --build -d
+ngrok http 8080
 ```
 
-Frontend hasil build perlu disajikan oleh web server internal atau reverse proxy. Arahkan `/api` ke backend dan sediakan TLS serta autentikasi perusahaan di reverse proxy sebelum dokumen vendor digunakan. Batasi akses jaringan ke server tersebut.
+Bagikan URL HTTPS yang diberikan Ngrok hanya kepada pengguna yang diizinkan. Laptop developer, Docker, dan tunnel Ngrok harus tetap aktif selama aplikasi digunakan. Hentikan tunnel dengan `Ctrl+C`, lalu jalankan `docker compose down` bila ingin menghentikan DocuFlow. Ngrok hanya untuk demo sementara, bukan production. DocuFlow tidak memiliki login aplikasi; URL tunnel dapat memberi akses ke dokumen yang diunggah, jadi batasi akses melalui kontrol Ngrok yang tersedia dan jangan membagikan URL secara publik.
 
-Kapasitas ekstraksi dibatasi per proses: `INSPECTION_WORKERS` adalah jumlah job aktif dan `INSPECTION_QUEUE_SLOTS` adalah jumlah permintaan tambahan yang boleh menunggu. Saat semua slot penuh, API mengembalikan HTTP 503 agar antrean dan pemakaian memori tidak tumbuh tanpa batas; pengguna perlu mencoba kembali. Mulai dari nilai contoh di atas, lalu sesuaikan hanya setelah pengukuran pada server target. Jangan menjalankan beberapa worker Uvicorn: progress dan cache saat ini berada di memori/proses lokal. Untuk multi-worker atau beberapa instance dibutuhkan penyimpanan progress/job bersama.
+## Deployment internal production
 
-`OCR_INTRA_OP_THREADS` membatasi jumlah thread CPU ONNX per inferensi (default `2`, dibatasi maksimal ke jumlah CPU logis yang terlihat). Saat startup, backend memuat sesi deteksi, orientasi, dan pengenalan RapidOCR sebelum health check menyatakan OCR `ready`; ini memindahkan inisialisasi model dari upload pertama ke startup server. Pada satu halaman scan nyata di mesin pengembangan, nilai `2` memangkas inferensi dari sekitar 22,0 detik menjadi 16,8 detik dengan teks, confidence, bounding box, dan hasil tabel yang sama pada pengulangan; hasil ini bukan jaminan waktu untuk dokumen atau server lain. Ukur kembali pada mesin deployment sebelum mengubah nilai atau menaikkan concurrency.
+DocuFlow tidak memiliki login aplikasi atau database pengguna. Jalur deployment utama adalah server internal perusahaan; pembatasan akses jaringan, TLS, reverse proxy, dan autentikasi tingkat perusahaan ditetapkan oleh tim IT.
 
-Batas ukuran unggahan bukan jaminan waktu selesai. Belum ada batas jumlah halaman atau kompleksitas halaman maupun SLA waktu ekstraksi. Jangan menjanjikan waktu universal; tetapkan SLA hanya setelah mengukur PDF digital, scan, campuran, dan beban bersamaan pada spesifikasi server deployment. Aplikasi belum memiliki autentikasi bawaan dan belum siap dipaparkan langsung ke internet.
+Project menyediakan Docker Compose untuk frontend Nginx dan backend FastAPI. Panduan kedua skenario, environment, storage, model OCR, jaringan, operasi, serta troubleshooting ada di [DEPLOYMENT.md](DEPLOYMENT.md). Production menggunakan Docker Compose pada server perusahaan; Nginx/reverse proxy dan HTTPS dikelola bersama tim IT, yang juga membatasi akses lewat jaringan atau gateway perusahaan.
+
+OCR lokal menggunakan RapidOCR dan ONNX Runtime; fallback struktur tabel RapidTable yang sudah digunakan di environment proyek juga disertakan dalam image. Model diunduh ketika pertama kali dimuat jika belum tersedia. Docker Compose menaruh model OCR, model RapidTable, dan cache OCR pada named volume; cache mengandung teks hasil OCR dan mengikuti retensi aplikasi (maksimum 256 MB dan 7 hari). Temporary raster diproses di filesystem sementara container dan dibersihkan oleh pipeline.
+
+Extraction queue, progress, dan cache runtime masih dikelola dalam satu proses backend. Jalankan satu worker dan satu instance sampai penyimpanan progress bersama dirancang serta diuji. Kebutuhan CPU/RAM dan waktu scan bergantung pada server dan dokumen; ukur pada infrastruktur perusahaan sebelum menetapkan kapasitas/SLA. Jangan expose aplikasi langsung ke internet tanpa kontrol akses dari infrastruktur perusahaan.
 
 ## Pemeriksaan perubahan
 
 Jalankan tes Python hanya pada direktori tes aplikasi. Jangan memakai discovery pytest dari root: folder eksperimen OCR berisi skrip bernama `test_*.py` untuk penggunaan manual.
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q
+python -m pytest tests -q
 node --test tests/frontend_table_interactions.test.mjs
 npm run build
 ```

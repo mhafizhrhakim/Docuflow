@@ -39,6 +39,11 @@ benchmark-results/
 /scripts/.env.example
 /scripts/.gitignore
 
+# Local experiments and archived patches are not part of the deployment app.
+/DocuFlow_OCR_Integration_Patch/
+/DocuFlow_Row_Recovery_Patch/
+/tools/
+
 # Environment / secrets
 .env
 .env.*

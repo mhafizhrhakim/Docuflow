@@ -32,9 +32,11 @@ const multiWorkflow = createMultiDocumentWorkflow({
   emptyState: $("#multi-empty"),
   statusElement: $("#multi-status"),
   combinedExportButton: $("#multi-export-button"),
+  combinedXlsxExportButton: $("#multi-xlsx-export-button"),
   overallProgressContainer: $("#multi-overall-progress"),
   overallProgressBar: $("#multi-overall-progress-bar"),
   overallProgressLabel: $("#multi-overall-progress-label"),
+  overallElapsedLabel: $("#multi-overall-progress-elapsed"),
   onDocumentInfo: updateDocumentIdentity,
 });
 

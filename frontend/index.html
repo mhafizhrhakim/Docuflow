@@ -112,6 +112,7 @@
               <div class="multi-overall-progress-copy">
                 <span class="multi-progress-spinner" aria-hidden="true"></span>
                 <strong id="single-progress-phase">Menunggu</strong>
+                <span id="single-progress-elapsed" class="multi-progress-elapsed" aria-live="off">Durasi 00:00</span>
                 <span id="single-progress-percent" class="multi-progress-percent">—</span>
               </div>
               <progress id="single-progress-bar" class="multi-progress-bar" max="100" value="0" aria-label="Progres analisis PDF"></progress>
@@ -430,14 +431,13 @@
                     ▢ Salin
                   </button>
 
-                  <button
-                    id="digital-export-button"
-                    class="button button-small"
-                    type="button"
-                    disabled
-                  >
-                    ⇩ Ekspor
-                  </button>
+                  <details class="table-export-menu">
+                    <summary class="button button-small" title="Pilih format unduhan">⇩ Ekspor</summary>
+                    <div class="table-export-menu-options">
+                      <button id="digital-export-button" class="button button-small" type="button" disabled title="CSV berisi data tabel tanpa format garis.">CSV</button>
+                      <button id="digital-xlsx-button" class="button button-small" type="button" disabled title="Workbook Excel dengan garis dan lebar kolom.">Excel (.xlsx)</button>
+                    </div>
+                  </details>
                 </div>
               </div>
 
@@ -483,14 +483,13 @@
                     ▢ Salin
                   </button>
 
-                  <button
-                    id="scan-export-button"
-                    class="button button-small"
-                    type="button"
-                    disabled
-                  >
-                    ⇩ Ekspor
-                  </button>
+                  <details class="table-export-menu">
+                    <summary class="button button-small" title="Pilih format unduhan">⇩ Ekspor</summary>
+                    <div class="table-export-menu-options">
+                      <button id="scan-export-button" class="button button-small" type="button" disabled title="CSV berisi data tabel tanpa format garis.">CSV</button>
+                      <button id="scan-xlsx-button" class="button button-small" type="button" disabled title="Workbook Excel dengan garis dan lebar kolom.">Excel (.xlsx)</button>
+                    </div>
+                  </details>
                 </div>
               </div>
 
@@ -521,7 +520,7 @@
               <h1>Multi-document</h1>
               <p>
                 Setiap PDF memiliki preview, navigasi halaman, dan tabel
-                ekstraksi sendiri. Hasil gabungan tersedia sebagai CSV terpisah.
+                ekstraksi sendiri. Hasil gabungan tersedia dalam format CSV dan Excel.
               </p>
             </div>
 
@@ -535,12 +534,17 @@
               <div class="multi-overall-progress-copy">
                 <span class="multi-progress-spinner" aria-hidden="true"></span>
                 <strong id="multi-overall-progress-label">Menunggu dokumen</strong>
+                <span class="multi-progress-elapsed" id="multi-overall-progress-elapsed" aria-live="off">Durasi 00:00</span>
               </div>
               <progress id="multi-overall-progress-bar" max="100" value="0" aria-label="Progres seluruh dokumen"></progress>
             </div>
-            <button id="multi-export-button" class="button button-secondary" type="button" disabled>
-              ⇩ Unduh hasil gabungan CSV
-            </button>
+            <details class="table-export-menu table-export-menu-bottom">
+              <summary class="button button-secondary" title="Pilih format hasil gabungan">⇩ Ekspor hasil gabungan</summary>
+              <div class="table-export-menu-options">
+                <button id="multi-export-button" class="button button-small" type="button" disabled title="Unduh hasil gabungan sebagai CSV tanpa format garis.">CSV</button>
+                <button id="multi-xlsx-export-button" class="button button-small" type="button" disabled title="Unduh hasil gabungan sebagai Excel bergaris.">Excel (.xlsx)</button>
+              </div>
+            </details>
           </section>
 
           <div id="multi-empty" class="panel multi-empty">

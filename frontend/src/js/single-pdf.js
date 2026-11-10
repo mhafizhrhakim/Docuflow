@@ -2,7 +2,8 @@
 import { createPdfViewer } from "./pdf-viewer.js";
 import { inspectPdfDocument } from "./api.js";
 import { isScanPage, pageHasNativeText, pageType } from "./page-classification.mjs";
-import { copyTablesToClipboard, downloadTablesAsCsv, renderDetectedTables } from "./extraction-table.js";
+import { copyTablesToClipboard, downloadTablesAsCsv, downloadTablesAsXlsx, renderDetectedTables } from "./extraction-table.js";
+import { createElapsedTimer } from "./elapsed-timer.js";
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -19,7 +20,9 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
   const singleProgress = $("#single-progress");
   const singleProgressPhase = $("#single-progress-phase");
   const singleProgressPercent = $("#single-progress-percent");
+  const singleProgressElapsed = $("#single-progress-elapsed");
   const singleProgressBar = $("#single-progress-bar");
+  const extractionTimer = createElapsedTimer(singleProgressElapsed);
 
   const digitalCount = $("#digital-count");
   const scanCount = $("#scan-count");
@@ -44,8 +47,10 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
   const scanTableFooter = $("#scan-table-footer");
   const digitalCopyButton = $("#digital-copy-button");
   const digitalExportButton = $("#digital-export-button");
+  const digitalXlsxButton = $("#digital-xlsx-button");
   const scanCopyButton = $("#scan-copy-button");
   const scanExportButton = $("#scan-export-button");
+  const scanXlsxButton = $("#scan-xlsx-button");
   const digitalSearch = $("#digital-search");
   const scanSearch = $("#scan-search");
 
@@ -77,6 +82,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
   function updateProgress(progress, { active = false } = {}) {
     latestSingleProgress = progress;
     if (!progress) {
+      extractionTimer.reset();
       singleProgress.hidden = true;
       singleProgress.classList.remove("is-active");
       singleProgressPhase.textContent = "Menunggu";
@@ -84,6 +90,12 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
       singleProgressBar.value = 0;
       singleProgress.removeAttribute("data-state");
       return;
+    }
+
+    if (active) extractionTimer.start();
+    else if (["completed", "partial_failure", "failed"].includes(progress.phase)
+      || ["completed", "partial_failure", "failed"].includes(progress.status)) {
+      extractionTimer.stop();
     }
 
     singleProgress.hidden = false;
@@ -327,6 +339,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
       digitalItemCount.textContent = "Tidak ada halaman digital";
       digitalCopyButton.disabled = true;
       digitalExportButton.disabled = true;
+      digitalXlsxButton.disabled = true;
       digitalSearch.disabled = true;
       digitalSubtitle.textContent = "Belum ada halaman untuk ditampilkan";
 
@@ -361,6 +374,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
     const digitalTables = (page.tables ?? []).filter((table) => table?.is_source_table !== false);
     digitalCopyButton.disabled = digitalTables.length === 0;
     digitalExportButton.disabled = digitalTables.length === 0;
+    digitalXlsxButton.disabled = digitalTables.length === 0;
     digitalSearch.disabled = analysisState !== "complete" || digitalTables.length === 0;
 
     renderTableForPage({
@@ -380,6 +394,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
       scanItemCount.textContent = "Tidak ada halaman scan";
       scanCopyButton.disabled = true;
       scanExportButton.disabled = true;
+      scanXlsxButton.disabled = true;
       scanSearch.disabled = true;
       scanSubtitle.textContent = "Belum ada halaman scan untuk ditampilkan";
 
@@ -419,6 +434,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
     const scanTables = (page.tables ?? []).filter((table) => table?.is_source_table !== false);
     scanCopyButton.disabled = scanTables.length === 0;
     scanExportButton.disabled = scanTables.length === 0;
+    scanXlsxButton.disabled = scanTables.length === 0;
     scanSearch.disabled = analysisState !== "complete" || scanTables.length === 0;
 
     renderTableForPage({
@@ -745,12 +761,14 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
     digitalItemCount.textContent = "Ekstraksi belum dijalankan";
     digitalCopyButton.disabled = true;
     digitalExportButton.disabled = true;
+    digitalXlsxButton.disabled = true;
 
     scanSubtitle.textContent = "Menunggu klasifikasi per halaman";
     scanPageBadge.textContent = "Belum diketahui";
     scanItemCount.textContent = "Ekstraksi belum dijalankan";
     scanCopyButton.disabled = true;
     scanExportButton.disabled = true;
+    scanXlsxButton.disabled = true;
 
     digitalEmpty.hidden = false;
     digitalEmpty.querySelector("strong").textContent =
@@ -828,6 +846,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
     const token = ++selectionToken;
     analysisAbortController?.abort();
     analysisAbortController = new AbortController();
+    extractionTimer.reset();
     updateProgress({ phase: "reading_pdf", status: "processing", total_pages: null }, { active: true });
 
     const incoming = [...(fileList ?? [])];
@@ -1101,7 +1120,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
     void viewer.goToPage(pages[sequence - 1]);
   }
 
-  function bindTableActions(copyButton, exportButton, getPageNumber, label) {
+  function bindTableActions(copyButton, exportButton, xlsxButton, getPageNumber, label) {
     copyButton.addEventListener("click", async () => {
       const pageNumber = getPageNumber();
       const page = getPageResult(pageNumber);
@@ -1113,6 +1132,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
       }
     });
     exportButton.addEventListener("click", () => {
+      exportButton.closest("details")?.removeAttribute("open");
       const pageNumber = getPageNumber();
       const page = getPageResult(pageNumber);
       try {
@@ -1120,6 +1140,7 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
           tables: (page?.tables ?? []).map((table) => ({ ...table, source_page: pageNumber })),
           sourceName: selectedFile?.name,
           pageNumber,
+          includeSourceColumns: false,
           filename: `${(selectedFile?.name || "docuflow").replace(/\.pdf$/i, "")}-halaman-${pageNumber}.csv`,
         });
         (label === "digital" ? digitalStatus : scanStatus).textContent = `CSV halaman ${pageNumber} diunduh.`;
@@ -1127,10 +1148,27 @@ export function createSinglePdfWorkflow({ onDocumentInfo = () => {} } = {}) {
         (label === "digital" ? digitalStatus : scanStatus).textContent = error?.message || "CSV gagal dibuat.";
       }
     });
+    xlsxButton.addEventListener("click", () => {
+      xlsxButton.closest("details")?.removeAttribute("open");
+      const pageNumber = getPageNumber();
+      const page = getPageResult(pageNumber);
+      try {
+        downloadTablesAsXlsx({
+          tables: (page?.tables ?? []).map((table) => ({ ...table, source_page: pageNumber })),
+          sourceName: selectedFile?.name,
+          pageNumber,
+          includeSourceColumns: false,
+          filename: `${(selectedFile?.name || "docuflow").replace(/\.pdf$/i, "")}-halaman-${pageNumber}.xlsx`,
+        });
+        (label === "digital" ? digitalStatus : scanStatus).textContent = `Excel halaman ${pageNumber} diunduh.`;
+      } catch (error) {
+        (label === "digital" ? digitalStatus : scanStatus).textContent = error?.message || "Workbook Excel gagal dibuat.";
+      }
+    });
   }
 
-  bindTableActions(digitalCopyButton, digitalExportButton, () => activeDigitalPage, "digital");
-  bindTableActions(scanCopyButton, scanExportButton, () => activeScanPage, "scan");
+  bindTableActions(digitalCopyButton, digitalExportButton, digitalXlsxButton, () => activeDigitalPage, "digital");
+  bindTableActions(scanCopyButton, scanExportButton, scanXlsxButton, () => activeScanPage, "scan");
 
   digitalPageInput.addEventListener("change", () => {
     handleSequenceInput({

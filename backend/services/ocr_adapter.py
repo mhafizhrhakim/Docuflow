@@ -62,12 +62,34 @@ def _read_ocr_cache(path: Path) -> dict[str, Any] | None:
             points = entry.get("points")
             if not isinstance(points, list) or len(points) < 4:
                 return None
+        stamp_regions = payload.get("stamp_regions")
+        if stamp_regions is not None and (
+            not isinstance(stamp_regions, list)
+            or any(
+                not isinstance(box, list)
+                or len(box) != 4
+                or any(
+                    not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or not 0.0 <= float(value) <= 1.0
+                    for value in box
+                )
+                for box in stamp_regions
+            )
+        ):
+            payload.pop("stamp_regions", None)
         return payload
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
 
 
-def _write_ocr_cache(path: Path, entries: list[dict[str, Any]], width: int, height: int) -> None:
+def _write_ocr_cache(
+    path: Path,
+    entries: list[dict[str, Any]],
+    width: int,
+    height: int,
+    stamp_regions: list[list[float]] | None = None,
+) -> None:
     """Write raw OCR output with bounded local retention."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +100,8 @@ def _write_ocr_cache(path: Path, entries: list[dict[str, Any]], width: int, heig
             "image_height": height,
             "entries": entries,
         }
+        if stamp_regions is not None:
+            payload["stamp_regions"] = stamp_regions
         with _OCR_CACHE_LOCK:
             # A partial/truncated JSON file is treated as a cache miss by the
             # reader, so direct writes remain safe even on Windows filesystems
@@ -280,17 +304,245 @@ def _entries_from_result(result: Any) -> list[dict[str, Any]]:
             try:
                 text, confidence, box = item
                 box = _plain(box)
-                if not str(text).strip() or box is None or len(box) < 4:
+                raw_text = str(text)
+                if not raw_text.strip() or box is None or len(box) < 4:
                     continue
                 points = [(float(p[0]), float(p[1])) for p in box]
                 entries.append({
-                    "text": str(text).strip(),
+                    # Keep the recognizer's exact string alongside the trimmed
+                    # version used by the existing geometry/table pipeline.
+                    "text": raw_text.strip(),
+                    "raw_text": raw_text,
                     "confidence": float(confidence),
                     "points": points,
                 })
             except (TypeError, ValueError, IndexError):
                 continue
     return entries
+
+
+def _detect_colored_stamp_regions(image_bytes: bytes | None) -> list[list[float]]:
+    """Find conservative, roughly round colored-ink regions in a page raster.
+
+    The result is only a review hint. It never masks pixels or changes OCR text.
+    Normalized boxes keep the cache independent from raster dimensions.
+    """
+    if not image_bytes:
+        return []
+    try:
+        import cv2
+        import numpy as np
+
+        image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None or len(image.shape) < 2:
+            return []
+        height, width = image.shape[:2]
+        if width < 80 or height < 80:
+            return []
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        # Saturated ink is distinct from typical black table text and gray rules.
+        mask = cv2.inRange(
+            hsv,
+            np.array([0, 35, 45], dtype=np.uint8),
+            np.array([179, 255, 255], dtype=np.uint8),
+        )
+        kernel_size = max(5, int(min(width, height) * 0.007) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        connected = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        page_area = float(width * height)
+        min_side = max(28, int(min(width, height) * 0.035))
+        max_side = int(min(width, height) * 0.35)
+        regions: list[list[float]] = []
+        for contour in contours:
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            area = float(cv2.contourArea(contour))
+            ratio = box_width / max(1.0, float(box_height))
+            extent = area / max(1.0, float(box_width * box_height))
+            if (
+                min(box_width, box_height) < min_side
+                or max(box_width, box_height) > max_side
+                or area / page_area < 0.0008
+                or not 0.68 <= ratio <= 1.48
+                or extent < 0.38
+            ):
+                continue
+            regions.append([
+                round(x / width, 6),
+                round(y / height, 6),
+                round((x + box_width) / width, 6),
+                round((y + box_height) / height, 6),
+            ])
+        return regions
+    except Exception:
+        # Optional visual analysis must never interrupt OCR extraction.
+        return []
+
+
+def recognize_stamp_occluded_numeric_crop(
+    page: Any, bbox: tuple[float, float, float, float] | list[float],
+) -> dict[str, Any] | None:
+    """Re-read one small numeric cell after suppressing colored ink and rules.
+
+    This is an opt-in recovery probe for cells already identified as overlapping
+    a colored stamp. It renders only the supplied cell crop at high resolution,
+    uses the existing RapidOCR recognizer, and never changes the page OCR cache.
+    """
+    source_page = getattr(page, "_page", page)
+    if not callable(getattr(source_page, "get_pixmap", None)):
+        return None
+    try:
+        x0, y0, x1, y1 = (float(value) for value in bbox)
+        if x1 <= x0 or y1 <= y0 or x1 - x0 > 160.0 or y1 - y0 > 45.0:
+            return None
+        import cv2
+        import numpy as np
+
+        scale = 600.0 / 72.0
+        pixmap = source_page.get_pixmap(
+            matrix=pymupdf.Matrix(scale, scale),
+            clip=pymupdf.Rect(x0, y0, x1, y1),
+            alpha=False,
+        )
+        if pixmap.width < 20 or pixmap.height < 12:
+            return None
+        image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+            pixmap.height, pixmap.width, pixmap.n
+        )[:, :, :3].copy()
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        saturated = (hsv[:, :, 1] >= 35) & (hsv[:, :, 2] >= 65)
+        if not np.any(saturated):
+            return None
+        hue_histogram = np.bincount(hsv[:, :, 0][saturated], minlength=180)
+        dominant_hue = int(np.argmax(hue_histogram))
+        hue_distance = np.abs(hsv[:, :, 0].astype(np.int16) - dominant_hue)
+        hue_distance = np.minimum(hue_distance, 180 - hue_distance)
+        colored_ink = saturated & (hue_distance <= 18)
+        engine = _get_engine()
+        recognizer = getattr(engine, "recognize_txt", None)
+        if not callable(recognizer):
+            return None
+
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        max_channel = np.max(image, axis=2)
+        variant_sources = []
+        white_stamp = image.copy()
+        white_stamp[colored_ink] = 255
+        variant_sources.append(white_stamp)
+        if np.any(colored_ink):
+            max_channel_stamp = image.copy()
+            max_channel_stamp[colored_ink] = np.repeat(
+                max_channel[colored_ink, None], 3, axis=1
+            )
+            variant_sources.append(max_channel_stamp)
+            luminance_stamp = image.copy()
+            luminance_stamp[colored_ink] = np.repeat(
+                gray[colored_ink, None], 3, axis=1
+            )
+            variant_sources.append(luminance_stamp)
+
+        variant_readings: list[dict[str, Any]] = []
+        for variant_source in variant_sources:
+            variant_gray = cv2.cvtColor(variant_source, cv2.COLOR_RGB2GRAY)
+            ink = cv2.threshold(
+                variant_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+            )[1]
+            horizontal_kernel = cv2.getStructuringElement(
+                cv2.MORPH_RECT, (max(15, int(ink.shape[1] * 0.35)), 1)
+            )
+            horizontal_rules = cv2.morphologyEx(ink, cv2.MORPH_OPEN, horizontal_kernel)
+            cleaned = cv2.subtract(ink, horizontal_rules)
+            recognition_image = cv2.cvtColor(255 - cleaned, cv2.COLOR_GRAY2RGB)
+            with _OCR_INFERENCE_SEMAPHORE:
+                output = recognizer([recognition_image])
+            texts = list(getattr(output, "txts", None) or [])
+            scores = list(getattr(output, "scores", None) or [])
+            if len(texts) != 1 or not str(texts[0]).strip() or not scores:
+                continue
+            variant_readings.append({
+                "text": str(texts[0]).strip(),
+                "confidence": max(0.0, min(1.0, float(scores[0]))),
+            })
+            if variant_readings[-1]["confidence"] >= 0.90:
+                break
+
+        if not variant_readings:
+            return None
+        best_reading = max(variant_readings, key=lambda item: item["confidence"])
+        return {
+            **best_reading,
+            "variant_readings": variant_readings,
+        }
+    except Exception:
+        # A failed optional crop probe must leave the normal review fallback intact.
+        return None
+
+
+def recognize_ocr_text_line_crop(
+    page: Any,
+    bbox: tuple[float, float, float, float] | list[float],
+    *,
+    dpi: int = 450,
+) -> dict[str, Any] | None:
+    """Read one geometrically isolated text line omitted by full-page OCR.
+
+    This crop path is intended for rare row-baseline gaps found during table
+    validation. It uses the existing RapidOCR recognizer and does not change or
+    repopulate the page OCR cache.
+    """
+    source_page = getattr(page, "_page", page)
+    if not callable(getattr(source_page, "get_pixmap", None)):
+        return None
+    try:
+        x0, y0, x1, y1 = (float(value) for value in bbox)
+        width, height = x1 - x0, y1 - y0
+        if (
+            width < 20.0 or height < 5.0 or width > 800.0 or height > 36.0
+            or dpi < 150 or dpi > 600
+        ):
+            return None
+        import cv2
+        import numpy as np
+
+        scale = float(dpi) / 72.0
+        pixmap = source_page.get_pixmap(
+            matrix=pymupdf.Matrix(scale, scale),
+            clip=pymupdf.Rect(x0, y0, x1, y1),
+            alpha=False,
+        )
+        if pixmap.width < 30 or pixmap.height < 12:
+            return None
+        image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+            pixmap.height, pixmap.width, pixmap.n
+        )[:, :, :3].copy()
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        ink = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )[1]
+        horizontal_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (max(15, int(ink.shape[1] * 0.35)), 1)
+        )
+        horizontal_rules = cv2.morphologyEx(ink, cv2.MORPH_OPEN, horizontal_kernel)
+        cleaned = cv2.subtract(ink, horizontal_rules)
+        recognition_image = cv2.cvtColor(255 - cleaned, cv2.COLOR_GRAY2RGB)
+        engine = _get_engine()
+        recognizer = getattr(engine, "recognize_txt", None)
+        if not callable(recognizer):
+            return None
+        with _OCR_INFERENCE_SEMAPHORE:
+            output = recognizer([recognition_image])
+        texts = list(getattr(output, "txts", None) or [])
+        scores = list(getattr(output, "scores", None) or [])
+        if len(texts) != 1 or not str(texts[0]).strip() or not scores:
+            return None
+        return {
+            "text": str(texts[0]).strip(),
+            "confidence": max(0.0, min(1.0, float(scores[0]))),
+            "crop_bbox": [x0, y0, x1, y1],
+        }
+    except Exception:
+        # A failed localized read must never interrupt normal table output.
+        return None
 
 
 def _estimate_row_slope(entries: list[dict[str, Any]], image_width: int) -> float:
@@ -366,6 +618,8 @@ class OCRPageProxy:
         cache_hit: bool = False,
         table_image_bytes: bytes | None = None,
         dpi: int = 150,
+        stamp_regions: list[list[float]] | None = None,
+        cache_path: Path | None = None,
     ) -> None:
         self._page = original_page
         self.rect = original_page.rect
@@ -374,6 +628,8 @@ class OCRPageProxy:
         self.render_elapsed_seconds = round(float(render_elapsed_seconds), 6)
         self.ocr_cache_hit = bool(cache_hit)
         self._table_image_bytes = table_image_bytes
+        self._stamp_regions_normalized = stamp_regions
+        self._cache_path = cache_path
         self._image_width = int(image_width)
         self._image_height = int(image_height)
         self._dpi = int(dpi)
@@ -396,6 +652,7 @@ class OCRPageProxy:
             y1 = max(point[1] for point in corrected) * sy
             self.items.append({
                 "text": entry["text"],
+                "raw_text": entry.get("raw_text", entry["text"]),
                 "x0": max(float(self.rect.x0), x0),
                 "y0": max(float(self.rect.y0), y0),
                 "x1": min(float(self.rect.x1), x1),
@@ -428,6 +685,29 @@ class OCRPageProxy:
             except Exception:
                 return None
         return self._table_image_bytes
+
+    def get_stamp_regions(self) -> list[list[float]]:
+        """Return possible stamp bboxes in source-page points, computing lazily."""
+        if self._stamp_regions_normalized is None:
+            image_bytes = self.get_table_image_bytes()
+            self._stamp_regions_normalized = _detect_colored_stamp_regions(image_bytes)
+            if self._cache_path is not None:
+                _write_ocr_cache(
+                    self._cache_path,
+                    self._ocr_entries,
+                    self._image_width,
+                    self._image_height,
+                    self._stamp_regions_normalized,
+                )
+        return [
+            [
+                max(float(self.rect.x0), box[0] * float(self.rect.width)),
+                max(float(self.rect.y0), box[1] * float(self.rect.height)),
+                min(float(self.rect.x1), box[2] * float(self.rect.width)),
+                min(float(self.rect.y1), box[3] * float(self.rect.height)),
+            ]
+            for box in self._stamp_regions_normalized
+        ]
 
     def get_text(self, option: str = "text", *args: Any, **kwargs: Any) -> Any:
         if option == "words":
@@ -515,6 +795,7 @@ def prepare_ocr_page(
                 "image_width": int(cached["image_width"]),
                 "image_height": int(cached["image_height"]), "dpi": dpi,
                 "render_elapsed": 0.0, "table_image_bytes": None,
+                "stamp_regions": cached.get("stamp_regions"),
                 "temp_path": None, "deskew_matrix": None, "deskew_angle": 0.0,
             }
 
@@ -547,12 +828,14 @@ def prepare_ocr_page(
             # installs, but OCR remains available if it cannot be imported.
             deskew_matrix = None
             deskew_angle = 0.0
+        stamp_regions = _detect_colored_stamp_regions(table_image_bytes)
         render_elapsed = time.perf_counter() - render_started
         return {
             "cache_path": cache_path, "cached_entries": None,
             "image_width": image_width, "image_height": image_height,
             "dpi": dpi, "render_elapsed": render_elapsed,
             "table_image_bytes": table_image_bytes, "temp_path": temp_path,
+            "stamp_regions": stamp_regions,
             "deskew_matrix": deskew_matrix, "deskew_angle": deskew_angle,
         }
     except Exception:
@@ -598,7 +881,13 @@ def infer_prepared_ocr(prepared: dict[str, Any]) -> dict[str, Any]:
     if not entries:
         raise RuntimeError("RapidOCR tidak menghasilkan kotak teks per kata.")
     if cache_path is not None and not cache_hit:
-        _write_ocr_cache(cache_path, entries, image_width, image_height)
+        _write_ocr_cache(
+            cache_path,
+            entries,
+            image_width,
+            image_height,
+            prepared.get("stamp_regions"),
+        )
     return {
         "entries": entries, "image_width": image_width,
         "image_height": image_height, "elapsed": elapsed,
@@ -614,6 +903,8 @@ def build_ocr_page_proxy(
         result["elapsed"], prepared["render_elapsed"],
         cache_hit=result["cache_hit"],
         table_image_bytes=prepared.get("table_image_bytes"), dpi=prepared["dpi"],
+        stamp_regions=prepared.get("stamp_regions"),
+        cache_path=prepared.get("cache_path"),
     )
     proxy.deskew_angle_degrees = float(prepared.get("deskew_angle", 0.0))
     return proxy

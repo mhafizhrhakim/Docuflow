@@ -72,7 +72,11 @@ def _page_image_coverage(
         if not bbox or len(bbox) != 4:
             continue
         try:
-            rect = pymupdf.Rect(bbox) & page_rect
+            rect = pymupdf.Rect(bbox)
+            rotation_matrix = getattr(page, "rotation_matrix", None)
+            if rotation_matrix is not None and int(getattr(page, "rotation", 0) or 0) % 360:
+                rect = rect * rotation_matrix
+            rect &= page_rect
         except Exception:
             continue
         if rect.is_empty or rect.is_infinite or rect.width <= 0 or rect.height <= 0:
@@ -108,6 +112,66 @@ def _page_image_coverage(
         union_area += (x1 - x0) * covered_y
 
     return max(0.0, min(1.0, union_area / page_area))
+
+
+def _page_text_image_overlap(
+    page: Any,
+    image_info: list[dict[str, Any]],
+) -> float | None:
+    """Measure how much native text is positioned over embedded image areas."""
+    # Avoid adding another linear pass over pathological pages whose content
+    # streams expand to hundreds of thousands of repeated image placements.
+    if not image_info or len(image_info) > 2_000:
+        return None
+    page_rect = page.rect
+    rotation_matrix = getattr(page, "rotation_matrix", None)
+    rotated = rotation_matrix is not None and bool(int(getattr(page, "rotation", 0) or 0) % 360)
+    image_rectangles: set[tuple[float, float, float, float]] = set()
+    for item in image_info:
+        bbox = item.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+        try:
+            rect = pymupdf.Rect(bbox)
+            if rotated:
+                rect = rect * rotation_matrix
+            rect &= page_rect
+        except Exception:
+            continue
+        if rect.is_empty or rect.is_infinite or rect.width <= 0 or rect.height <= 0:
+            continue
+        image_rectangles.add((float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)))
+    if not image_rectangles:
+        return None
+
+    try:
+        words = page.get_text("words", sort=True)
+    except Exception:
+        return None
+    text_centers: list[tuple[float, float]] = []
+    for word in words:
+        if len(word) < 5 or not str(word[4]).strip():
+            continue
+        try:
+            x0, y0, x1, y1 = (float(value) for value in word[:4])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if x1 > x0 and y1 > y0:
+            word_rect = pymupdf.Rect(x0, y0, x1, y1)
+            if rotated:
+                word_rect = word_rect * rotation_matrix
+            text_centers.append((
+                (float(word_rect.x0) + float(word_rect.x1)) / 2.0,
+                (float(word_rect.y0) + float(word_rect.y1)) / 2.0,
+            ))
+    if not text_centers:
+        return None
+
+    overlapping = sum(
+        any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in image_rectangles)
+        for x, y in text_centers
+    )
+    return overlapping / len(text_centers)
 
 
 def _page_image_info_for_classification(page: Any) -> tuple[int, list[dict[str, Any]]]:
@@ -380,12 +444,18 @@ def inspect_pdf(
             # Actual raster pages still use the unchanged bbox coverage logic.
             image_count, image_info = _page_image_info_for_classification(page)
             image_coverage = _page_image_coverage(page, image_count, image_info)
+            text_image_overlap = (
+                _page_text_image_overlap(page, image_info)
+                if has_text and image_count > 0
+                else None
+            )
             image_info_coverage_seconds = time.perf_counter() - stage_started
             stage_started = time.perf_counter()
             source_candidate = classify_page_source(
                 has_extractable_text=has_text,
                 image_count=image_count,
                 image_coverage=image_coverage,
+                text_image_overlap=text_image_overlap,
             )
             classification_seconds = time.perf_counter() - stage_started
 

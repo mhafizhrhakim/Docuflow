@@ -14,11 +14,13 @@ Ambiguous layouts should be reviewed rather than treated as authoritative.
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from decimal import Decimal, InvalidOperation
 import logging
+import math
 import re
 import time
 from statistics import median
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +300,56 @@ def _word_runs_on_visual_baselines(page: Any) -> list[dict[str, Any]]:
         else:
             baselines.append({"y": center_y, "words": [word]})
 
+    # On scanned pages, OCR often places a left-side item number on a nearby
+    # baseline from the same physical row (the description and numeric cells
+    # can be 6–9 pt higher because of skew or cell vertical alignment). Keep
+    # that identifier with the row whose text and right-side values share its
+    # horizontal span. Do not widen the global baseline tolerance: that would
+    # merge genuine wrapped description lines on dense tables.
+    if getattr(page, "ocr_word_count", 0) and len(baselines) > 1:
+        page_width = float(page.rect.width)
+        for baseline_index, baseline in enumerate(baselines):
+            identifiers = [
+                word for word in baseline["words"]
+                if float(word["x0"]) <= page_width * 0.16
+                and _is_item_identifier(str(word["text"]))
+            ]
+            if not identifiers:
+                continue
+            neighboring = []
+            for target_index in (baseline_index - 1, baseline_index + 1):
+                if not 0 <= target_index < len(baselines):
+                    continue
+                target = baselines[target_index]
+                vertical_gap = abs(float(target["y"]) - float(baseline["y"]))
+                target_words = target["words"]
+                right_words = [word for word in target_words if float(word["x0"]) > page_width * 0.28]
+                right_numeric_words = [word for word in right_words if _is_numeric_token(str(word["text"]))]
+                x_span = (
+                    max((float(word["x1"]) for word in target_words), default=0.0)
+                    - min((float(word["x0"]) for word in target_words), default=0.0)
+                )
+                if (
+                    4.5 <= vertical_gap <= 10.0
+                    and len(right_words) >= 2
+                    and len(right_numeric_words) >= 2
+                    and x_span >= page_width * 0.48
+                ):
+                    neighboring.append((vertical_gap, target_index))
+            if neighboring:
+                _gap, target_index = min(neighboring)
+                target = baselines[target_index]
+                for word in identifiers:
+                    baseline["words"].remove(word)
+                    target["words"].append(word)
+                if not baseline["words"]:
+                    baseline["remove"] = True
+                centers = [
+                    (word["y0"] + word["y1"]) / 2 for word in target["words"]
+                ]
+                target["y"] = float(median(centers))
+        baselines = [baseline for baseline in baselines if not baseline.get("remove")]
+
     output: list[dict[str, Any]] = []
     for baseline in baselines:
         ordered = sorted(baseline["words"], key=lambda item: item["x0"])
@@ -310,15 +362,33 @@ def _word_runs_on_visual_baselines(page: Any) -> list[dict[str, Any]]:
             else:
                 runs[-1].append(word)
         run_payloads = []
+
+        def make_run_payload(run_words: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "text": " ".join(word["text"] for word in run_words).strip(),
+                "x0": min(word["x0"] for word in run_words),
+                "y0": min(word["y0"] for word in run_words),
+                "x1": max(word["x1"] for word in run_words),
+                "y1": max(word["y1"] for word in run_words),
+                "words": run_words,
+            }
+
         for run in runs:
-            run_payloads.append({
-                "text": " ".join(word["text"] for word in run).strip(),
-                "x0": min(word["x0"] for word in run),
-                "y0": min(word["y0"] for word in run),
-                "x1": max(word["x1"] for word in run),
-                "y1": max(word["y1"] for word in run),
-                "words": run,
-            })
+            # OCR can join a compact row identifier and its description when
+            # the gap is slightly smaller than the detected word spacing. Keep
+            # those as separate geometric runs so the identifier can anchor a
+            # row and the description can occupy its own observed lane.
+            if (
+                getattr(page, "ocr_word_count", 0)
+                and len(run) >= 2
+                and float(run[0]["x0"]) <= float(page.rect.width) * 0.42
+                and _is_item_identifier(run[0]["text"])
+                and any(re.search(r"[A-Za-zÀ-ž]", word["text"]) for word in run[1:])
+            ):
+                run_payloads.append(make_run_payload(run[:1]))
+                run_payloads.append(make_run_payload(run[1:]))
+            else:
+                run_payloads.append(make_run_payload(run))
         output.append({
             "y": baseline["y"],
             "x0": min(item["x0"] for item in ordered),
@@ -327,6 +397,25 @@ def _word_runs_on_visual_baselines(page: Any) -> list[dict[str, Any]]:
             "runs": run_payloads,
         })
     return output
+
+
+def _without_browser_print_footer_lines(
+    lines: list[dict[str, Any]], page_height: float,
+) -> list[dict[str, Any]]:
+    """Remove a browser-generated about:blank footer from OCR table geometry."""
+    retained: list[dict[str, Any]] = []
+    for line in lines:
+        if float(line.get("y", 0.0)) < page_height * 0.82:
+            retained.append(line)
+            continue
+        footer_tokens = {
+            re.sub(r"[^a-z]", "", _clean_cell(run.get("text", "")).casefold())
+            for run in line.get("runs", [])
+        }
+        if "aboutblank" in footer_tokens:
+            continue
+        retained.append(line)
+    return retained
 
 
 def _is_currency_marker(value: str) -> bool:
@@ -1300,14 +1389,18 @@ def _is_item_identifier(value: str) -> bool:
     return any(re.fullmatch(pattern, value) for pattern in patterns)
 
 
-def _is_header_like_run(run: dict[str, Any]) -> bool:
+def _is_header_like_run(run: dict[str, Any], *, ocr_page: bool = False) -> bool:
     text = _clean_cell(run.get("text", "")).strip(" _-:|•")
     if not text or not re.search(r"[A-Za-zÀ-ž]", text):
         return False
     if _MONEY_TOKEN_RE.search(text):
         return False
     # Short labels and multiword column titles are expected; sentence-sized
-    # runs are more likely prose than a table header.
+    # runs are more likely prose than a table header. OCR can combine adjacent
+    # header cells into one run; allow a slightly longer run only on OCR pages,
+    # where observed body lanes must still prove a valid split.
+    if ocr_page:
+        return len(text) <= 64 and len(text.split()) <= 10
     return len(text) <= 48 and len(text.split()) <= 6
 
 
@@ -1433,7 +1526,7 @@ def _candidate_header_records(
             continue
         runs = [
             run for run in line["runs"]
-            if _is_header_like_run(run)
+            if _is_header_like_run(run, ocr_page=ocr_page)
         ]
         if not 2 <= len(runs) <= 12:
             continue
@@ -1465,6 +1558,36 @@ def _candidate_header_records(
     return candidates
 
 
+def _split_stacked_header_run_by_columns(
+    run: dict[str, Any], column_starts: list[float],
+) -> list[dict[str, Any]]:
+    """Split an OCR stacked-header run when its words align to adjacent columns."""
+    words = sorted(
+        (word for word in run.get("words", []) if str(word.get("text", "")).strip()),
+        key=lambda word: float(word.get("x0", 0.0)),
+    )
+    if len(words) < 2 or len(column_starts) < 2:
+        return [run]
+    if any(len(str(word.get("text", ""))) > 24 for word in words):
+        return [run]
+
+    assignments = [_assign_run_to_column(word, column_starts) for word in words]
+    mapped = sorted(set(assignments))
+    if len(mapped) < 2 or any(right - left > 1 for left, right in zip(mapped, mapped[1:])):
+        return [run]
+
+    groups: list[list[dict[str, Any]]] = []
+    group_columns: list[int] = []
+    for word, column in zip(words, assignments):
+        if not groups or column != group_columns[-1]:
+            groups.append([])
+            group_columns.append(column)
+        groups[-1].append(word)
+    if len(groups) < 2:
+        return [run]
+    return [_positioned_word_group(group) for group in groups]
+
+
 def _merge_stacked_header_labels(
     header: dict[str, Any],
     lines: list[dict[str, Any]],
@@ -1489,53 +1612,58 @@ def _merge_stacked_header_labels(
         delta = float(line["y"]) - float(header["y"])
         if delta == 0 or delta < -14.0 or delta > 15.0 or abs(delta) < 2.5:
             continue
-        for run in line["runs"]:
-            raw_text = _clean_cell(run["text"])
-            # Key/value metadata such as "Dock:" or "ETA:" above a quotation
-            # table is not a stacked column header.
-            if delta < 0 and raw_text.rstrip().endswith(":"):
-                continue
-            text = raw_text.strip(" _-:")
-            if not text or len(text) > 24 or not re.search(r"[A-Za-zÀ-ž]", text):
-                continue
-            if _is_numeric_token(text):
-                continue
-            # Decorative rules/underscores have no alphabetic content after
-            # normalization and were filtered above.
-            column = _assign_run_to_column(run, starts)
-            # A short, numbered label immediately below a first-column header
-            # is often a section/category label rather than a second header
-            # row. Its position and token shape distinguish it without a
-            # document-specific vocabulary.
-            if (
-                not ocr_page
-                and delta > 0
-                and column == 0
-                and len(line.get("runs", [])) == 1
-                and re.match(r"^\d+(?:[.)])?\s+[A-Za-zÀ-ž]", text)
-                and float(run["x0"]) <= starts[0] + 8.0
-            ):
-                continue
-            center = (float(run["x0"]) + float(run["x1"])) / 2
-            # Require spatial alignment with the actual header start/center.
-            if abs(float(run["x0"]) - starts[column]) > 28.0 and abs(center - centers[column]) > 32.0:
-                continue
-            normalized = text.strip("() ")
-            if not normalized or normalized.casefold() in headers[column].casefold():
-                continue
-            if delta < 0:
-                headers[column] = f"{normalized} {headers[column]}".strip()
-            else:
-                headers[column] = f"{headers[column]} ({normalized})".strip()
-            # Save the exact position of each attached sub-header. Metadata
-            # exclusion uses these component boxes instead of expanding one big
-            # header rectangle into nearby but unrelated fields.
-            stacked_header_bboxes.append([
-                round(float(run["x0"]), 2),
-                round(float(run["y0"]), 2),
-                round(float(run["x1"]), 2),
-                round(float(run["y1"]), 2),
-            ])
+        for source_run in line["runs"]:
+            stacked_runs = (
+                _split_stacked_header_run_by_columns(source_run, starts)
+                if ocr_page else [source_run]
+            )
+            for run in stacked_runs:
+                raw_text = _clean_cell(run["text"])
+                # Key/value metadata such as "Dock:" or "ETA:" above a quotation
+                # table is not a stacked column header.
+                if delta < 0 and raw_text.rstrip().endswith(":"):
+                    continue
+                text = raw_text.strip(" _-:")
+                if not text or len(text) > 24 or not re.search(r"[A-Za-zÀ-ž]", text):
+                    continue
+                if _is_numeric_token(text):
+                    continue
+                # Decorative rules/underscores have no alphabetic content after
+                # normalization and were filtered above.
+                column = _assign_run_to_column(run, starts)
+                # A short, numbered label immediately below a first-column header
+                # is often a section/category label rather than a second header
+                # row. Its position and token shape distinguish it without a
+                # document-specific vocabulary.
+                if (
+                    not ocr_page
+                    and delta > 0
+                    and column == 0
+                    and len(line.get("runs", [])) == 1
+                    and re.match(r"^\d+(?:[.)])?\s+[A-Za-zÀ-ž]", text)
+                    and float(run["x0"]) <= starts[0] + 8.0
+                ):
+                    continue
+                center = (float(run["x0"]) + float(run["x1"])) / 2
+                # Require spatial alignment with the actual header start/center.
+                if abs(float(run["x0"]) - starts[column]) > 28.0 and abs(center - centers[column]) > 32.0:
+                    continue
+                normalized = text.strip("() ")
+                if not normalized or normalized.casefold() in headers[column].casefold():
+                    continue
+                if delta < 0:
+                    headers[column] = f"{normalized} {headers[column]}".strip()
+                else:
+                    headers[column] = f"{headers[column]} ({normalized})".strip()
+                # Save the exact position of each attached sub-header. Metadata
+                # exclusion uses these component boxes instead of expanding one big
+                # header rectangle into nearby but unrelated fields.
+                stacked_header_bboxes.append([
+                    round(float(run["x0"]), 2),
+                    round(float(run["y0"]), 2),
+                    round(float(run["x1"]), 2),
+                    round(float(run["y1"]), 2),
+                ])
     header["stacked_header_bboxes"] = stacked_header_bboxes
     return headers, centers, starts
 
@@ -1792,7 +1920,7 @@ def _assign_continuation_column(
     return None
 
 def _split_header_runs_by_observed_lanes(
-    header: dict[str, Any], lines: list[dict[str, Any]],
+    header: dict[str, Any], lines: list[dict[str, Any]], *, ocr_page: bool = False,
 ) -> dict[str, Any]:
     """Split accidentally merged header words when data proves two columns.
 
@@ -1813,8 +1941,11 @@ def _split_header_runs_by_observed_lanes(
     # (e.g. item number 1 under "Item No"). Scale the alignment tolerance to
     # the observed first-column width rather than demanding identical x starts.
     first_anchor_tolerance = max(18.0, min(48.0, first_column_gap * 0.55))
-    likely_data_starts: list[float] = []
+    likely_data_starts: list[tuple[float, int]] = []
     likely_data_row_count = 0
+    observed_page_width = max(
+        (float(line.get("x1", 0.0)) for line in lines), default=600.0
+    )
     for line in lines:
         y = float(line["y"])
         if y <= header_y + 13.0 or y > header_y + 280.0:
@@ -1831,17 +1962,40 @@ def _split_header_runs_by_observed_lanes(
         # run contains both an identifier label and the adjacent description
         # label, excluding this first data run leaves the identifier word with
         # no observed lane to align to, so the header cannot be split reliably.
-        likely_data_starts.append(float(first["x0"]))
-        for run in line["runs"][1:]:
+        likely_data_starts.append((float(first["x0"]), likely_data_row_count - 1))
+        description_start = None
+        for run_index, run in enumerate(line["runs"][1:], start=1):
             words = list(run.get("words", []))
+            run_x = float(run["x0"])
+            if description_start is None:
+                # The first run after an item identifier anchors the prose
+                # lane. Later word runs inside that wide cell (catalog refs,
+                # wrapped phrases, etc.) are content, not extra columns.
+                description_start = run_x
+                likely_data_starts.append((run_x, likely_data_row_count - 1))
+                continue
             # Adjacent data columns can touch visually (e.g. quantity followed
-            # by a unit token). Add a second lane only for compact two-token
-            # runs containing a numeric token; long descriptions are not split
-            # into artificial columns.
+            # by a unit token). Additional lanes need independent compact or
+            # numeric evidence and must be separated from the prose start;
+            # repeated word starts inside a long description are ignored.
             if len(words) == 2 and any(_is_numeric_token(str(word.get("text", ""))) for word in words):
-                likely_data_starts.extend(float(word["x0"]) for word in words)
-            else:
-                likely_data_starts.append(float(run["x0"]))
+                likely_data_starts.extend(
+                    (float(word["x0"]), likely_data_row_count - 1)
+                    for word in words
+                )
+                continue
+            run_text = _clean_cell(run.get("text", "")).strip()
+            compact_cell = (
+                len(words) <= 2
+                and len(run_text) <= 10
+                and bool(re.fullmatch(r"[A-Za-z0-9./%+_-]+", run_text))
+            )
+            numeric_cell = _is_numeric_token(run_text)
+            if (
+                (compact_cell or numeric_cell)
+                and run_x - description_start >= observed_page_width * 0.10
+            ):
+                likely_data_starts.append((run_x, likely_data_row_count - 1))
     # One isolated row can contain a currency marker and amount as separate
     # visual runs inside one wide source cell. It is not enough evidence to
     # infer columns from body positions alone. A merged Qty/Unit header is a
@@ -1850,7 +2004,10 @@ def _split_header_runs_by_observed_lanes(
     normalized_header_text = " ".join(
         re.sub(
             r"[^a-z0-9]+", " ",
-            re.sub(r"['’]", "", str(run.get("text", "")).casefold()),
+            re.sub(
+                r"(?<=[a-z])['’](?=[a-z])", "",
+                str(run.get("text", "")).casefold(),
+            ),
         ).strip()
         for run in header_runs
     )
@@ -1868,13 +2025,65 @@ def _split_header_runs_by_observed_lanes(
 
     # Collapse starts repeated across item rows into lanes. The tolerance is
     # geometric (PDF points), not tied to any header or vendor name.
-    clusters: list[list[float]] = []
-    for x in sorted(likely_data_starts):
-        if clusters and abs(x - median(clusters[-1])) <= 8.0:
-            clusters[-1].append(x)
+    clusters: list[list[tuple[float, int]]] = []
+    for x, row_index in sorted(likely_data_starts):
+        if clusters and abs(x - median(item[0] for item in clusters[-1])) <= 8.0:
+            clusters[-1].append((x, row_index))
         else:
-            clusters.append([x])
-    lanes = [float(median(cluster)) for cluster in clusters]
+            clusters.append([(x, row_index)])
+    minimum_lane_support = (
+        1 if likely_data_row_count < 2 and has_quantity_unit_header
+        else max(2, math.ceil(likely_data_row_count * 0.25))
+    )
+    lanes = [
+        float(median(x for x, _row in cluster))
+        for cluster in clusters
+        if len({row_index for _x, row_index in cluster}) >= minimum_lane_support
+    ]
+    # OCR can repeatedly start words from a long description at a similar x
+    # (for example, a catalog reference embedded mid-sentence), making that
+    # text position look like an extra column lane. A genuine lane in a compact
+    # group of value columns is supported by much smaller neighboring gaps.
+    # Remove only an interior lane bracketed by two unusually wide gaps; close
+    # neighboring header labels remain available for the split logic below.
+    header_words_span_lanes = False
+    if lanes:
+        for run in header_runs:
+            if len(run.get("words", [])) < 2:
+                continue
+            word_positions = [
+                float(word["x0"])
+                for word in run.get("words", [])
+                if str(word.get("text", "")).strip() and word.get("x0") is not None
+            ]
+            if not word_positions:
+                continue
+            mapped_header_lanes = {
+                min(range(len(lanes)), key=lambda lane_index: abs(x - lanes[lane_index]))
+                for x in word_positions
+            }
+            if len(mapped_header_lanes) > 1:
+                header_words_span_lanes = True
+                break
+    while (
+        len(lanes) > len(header_runs)
+        and len(lanes) >= 4
+        and not header_words_span_lanes
+    ):
+        gaps = [right - left for left, right in zip(lanes, lanes[1:])]
+        typical_gap = float(median(sorted(gaps)[:max(2, len(gaps) // 2)]))
+        wide_gap_threshold = max(24.0, typical_gap * 2.5)
+        redundant_indexes = [
+            index for index in range(1, len(lanes) - 1)
+            if min(gaps[index - 1], gaps[index]) >= wide_gap_threshold
+        ]
+        if not redundant_indexes:
+            break
+        drop_index = max(
+            redundant_indexes,
+            key=lambda index: min(gaps[index - 1], gaps[index]),
+        )
+        lanes.pop(drop_index)
     if len(lanes) < 2:
         return header
     header = dict(header)
@@ -1892,6 +2101,64 @@ def _split_header_runs_by_observed_lanes(
             x = float(word["x0"])
             lane_index = min(range(len(lanes)), key=lambda index: abs(x - lanes[index]))
             assignments.append(lane_index if abs(x - lanes[lane_index]) <= 22.0 else None)
+        if ocr_page:
+            # OCR sometimes places a second-line header fragment just inside
+            # the next data lane. Reattach a compact neighboring token only
+            # when its box is nearly touching the preceding word, it sits lower
+            # on the page, and it would otherwise cross exactly one lane.
+            for word_index in range(1, len(words)):
+                previous_text = re.sub(r"[^A-Za-z]", "", str(words[word_index - 1].get("text", "")))
+                current_raw = str(words[word_index].get("text", "")).strip()
+                current_text = re.sub(r"[^A-Za-z]", "", current_raw)
+                word_gap = float(words[word_index]["x0"]) - float(words[word_index - 1]["x1"])
+                previous_center_y = (
+                    float(words[word_index - 1]["y0"]) + float(words[word_index - 1]["y1"])
+                ) / 2.0
+                current_center_y = (
+                    float(words[word_index]["y0"]) + float(words[word_index]["y1"])
+                ) / 2.0
+                previous_height = max(
+                    1.0, float(words[word_index - 1]["y1"]) - float(words[word_index - 1]["y0"])
+                )
+                current_height = max(
+                    1.0, float(words[word_index]["y1"]) - float(words[word_index]["y0"])
+                )
+                lower_neighbor_is_wrapped = (
+                    len(previous_text) <= 8
+                    and 1 <= len(current_text) <= 8
+                    and current_center_y - previous_center_y >= max(2.0, min(previous_height, current_height) * 0.30)
+                )
+                opening_mark_starts_wrapped_label = (
+                    current_raw.startswith("(")
+                    and current_center_y - previous_center_y >= max(2.0, min(previous_height, current_height) * 0.30)
+                )
+                compact_abbreviation_crosses_lane = (
+                    len(previous_text) == 1
+                    and len(current_text) == 1
+                    and current_raw.endswith(".")
+                    and abs(current_center_y - previous_center_y) <= max(previous_height, current_height)
+                )
+                if (
+                    assignments[word_index] is not None
+                    and assignments[word_index - 1] is not None
+                    and abs(assignments[word_index] - assignments[word_index - 1]) == 1
+                    and (
+                        (-8.0 <= word_gap <= 10.0
+                         and (lower_neighbor_is_wrapped or opening_mark_starts_wrapped_label))
+                        or (-2.0 <= word_gap <= 9.0 and compact_abbreviation_crosses_lane)
+                    )
+                ):
+                    assignments[word_index] = assignments[word_index - 1]
+                elif (
+                    str(words[word_index - 1].get("text", "")).strip().startswith("(")
+                    and 1 <= len(current_text) <= 4
+                    and assignments[word_index] is not None
+                    and assignments[word_index - 1] is not None
+                    and abs(assignments[word_index] - assignments[word_index - 1]) == 1
+                    and -4.0 <= word_gap <= 10.0
+                    and abs(current_center_y - previous_center_y) <= max(previous_height, current_height)
+                ):
+                    assignments[word_index] = assignments[word_index - 1]
         mapped = {value for value in assignments if value is not None}
         if len(mapped) < 2:
             rebuilt.append(run)
@@ -1919,14 +2186,14 @@ def _split_header_runs_by_observed_lanes(
         changed = True
         for entry in groups:
             group = entry["words"]
-            rebuilt.append({
-                "text": " ".join(str(word["text"]) for word in group).strip(),
-                "x0": min(float(word["x0"]) for word in group),
-                "y0": min(float(word["y0"]) for word in group),
-                "x1": max(float(word["x1"]) for word in group),
-                "y1": max(float(word["y1"]) for word in group),
-                "words": group,
-            })
+            rebuilt_run = _positioned_word_group(group)
+            if ocr_page:
+                rebuilt_run["text"] = re.sub(
+                    r"\b([A-Za-z])\s+([A-Za-z]\.)",
+                    r"\1\2",
+                    rebuilt_run["text"],
+                )
+            rebuilt.append(rebuilt_run)
     if changed:
         rebuilt.sort(key=lambda run: float(run["x0"]))
         header = dict(header)
@@ -2008,7 +2275,9 @@ def _extract_geometry_table(
     line_y_positions = [float(line["y"]) for line in lines]
     ocr_x_slope = _estimate_ocr_column_x_slope(lines, page_width) if is_ocr_page else 0.0
     for original_header in header_candidates:
-        header = _split_header_runs_by_observed_lanes(original_header, lines)
+        header = _split_header_runs_by_observed_lanes(
+            original_header, lines, ocr_page=is_ocr_page
+        )
         headers, centers, column_starts = _merge_stacked_header_labels(
             header, lines, page_width=page_width, ocr_page=is_ocr_page
         )
@@ -2109,6 +2378,16 @@ def _extract_geometry_table(
             - mean_distance / 25
             - first_anchor_distance * 0.4
         )
+        if is_ocr_page:
+            observed_lane_count = len(header.get("observed_data_lanes", []))
+            # When repeated OCR rows expose more stable cell starts than a
+            # candidate header has labels, that candidate is likely a nearby
+            # metadata band (or a header that OCR merged). Prefer candidates
+            # whose labels can be reconciled with those independently observed
+            # lanes; a later true header is stronger evidence than a page title.
+            if observed_lane_count >= 3 and len(grouped_anchors) >= 3:
+                missing_header_lanes = max(0, observed_lane_count - len(headers))
+                score -= min(60.0, missing_header_lanes * 12.0)
         evaluated.append((
             score, header, grouped_anchors, column_starts, headers, centers,
             header_y, x_slope,
@@ -2190,8 +2469,26 @@ def _extract_geometry_table(
     last_row_end = anchors[-1]["y"] + min(48.0, max(4.0, typical_gap * 1.15))
 
     for index, anchor in enumerate(anchors):
-        row_start = float(anchor["y"] - 2.5)
-        row_end = float(anchors[index + 1]["y"] - 2.0) if index + 1 < len(anchors) else last_row_end
+        if is_ocr_page:
+            # OCR can place a wrapped description line just above its item
+            # number baseline. Divide the gap at its midpoint. Add a small
+            # geometry tolerance and assign the boundary to the preceding row;
+            # OCR baselines can straddle the exact midpoint by a few points
+            # even when the continuation clearly belongs to that row.
+            row_boundary_tolerance = 5.0
+            row_start = (
+                float((anchors[index - 1]["y"] + anchor["y"]) / 2.0)
+                + row_boundary_tolerance
+                if index > 0 else float(header_y + 2.5)
+            )
+            row_end = (
+                float((anchor["y"] + anchors[index + 1]["y"]) / 2.0)
+                + row_boundary_tolerance
+                if index + 1 < len(anchors) else last_row_end
+            )
+        else:
+            row_start = float(anchor["y"] - 2.5)
+            row_end = float(anchors[index + 1]["y"] - 2.0) if index + 1 < len(anchors) else last_row_end
         cells: list[list[str]] = [[] for _ in headers]
         row_spans: list[dict[str, Any]] = []
         alignment_uncertain = False
@@ -2201,11 +2498,77 @@ def _extract_geometry_table(
             y = float(line["y"])
             if y < row_start or y >= row_end:
                 continue
+            if (
+                is_ocr_page
+                and y > anchor["y"] + 2.5
+                and len(line.get("runs", [])) == 1
+            ):
+                margin_run = line["runs"][0]
+                margin_text = _clean_cell(margin_run.get("text", "")).strip()
+                if (
+                    float(margin_run["x0"]) < first_lane_boundary
+                    and re.search(r"[A-Za-zÀ-ž]", margin_text)
+                    and not _is_item_identifier(margin_text)
+                ):
+                    # Preserve scan notes/footer text in the identifier gutter
+                    # as context instead of appending it to the item number.
+                    context_rows.append({
+                        "type": "unclassified_context",
+                        "cells": [margin_text],
+                        "text": margin_text,
+                        "source_bbox": [
+                            round(float(margin_run[key]), 2)
+                            for key in ("x0", "y0", "x1", "y1")
+                        ],
+                    })
+                    continue
+            if is_ocr_page:
+                line_has_identifier = any(
+                    float(run["x0"]) < first_lane_boundary
+                    and _is_item_identifier(str(run.get("text", "")))
+                    for run in line.get("runs", [])
+                )
+                text_continuations = [
+                    run for run in line.get("runs", [])
+                    if float(run["x0"]) >= first_lane_boundary
+                    and len(_clean_cell(run.get("text", "")).strip()) >= 12
+                    and re.search(r"[A-Za-zÀ-ž]", str(run.get("text", "")))
+                ]
+                body_value_lanes = (
+                    observed_data_lanes[2:]
+                    if len(observed_data_lanes) == len(headers)
+                    else column_starts[2:]
+                )
+                compact_value_evidence = sum(
+                    1 for run in line.get("runs", [])
+                    if len(_clean_cell(run.get("text", "")).strip()) <= 12
+                    and any(
+                        abs(float(run["x0"]) - float(lane)) <= 20.0
+                        for lane in body_value_lanes
+                    )
+                )
+                if (
+                    not line_has_identifier
+                    and text_continuations
+                    and compact_value_evidence < 2
+                    and len(headers) > 1
+                ):
+                    # A wrapped OCR description can visually extend through
+                    # several empty numeric cells. Keep that text in the
+                    # description lane unless separate compact values provide
+                    # evidence for additional populated cells on this line.
+                    cells[1].extend(
+                        _clean_cell(run.get("text", ""))
+                        for run in line.get("runs", [])
+                        if float(run["x0"]) >= first_lane_boundary
+                        and _clean_cell(run.get("text", "")).strip()
+                    )
+                    row_spans.extend(line.get("runs", []))
+                    continue
             if index == len(anchors) - 1 and y > anchor["y"] + 2.5 and summary_candidates:
                 is_positioned_summary = any(
                     abs(float(summary.get("_y", -10000.0)) - y) <= 3.0
                     and summary.get("source_bbox")
-                    and float(summary["source_bbox"][0]) < first_lane_boundary
                     for summary in summary_candidates
                 )
                 if is_positioned_summary:
@@ -2570,6 +2933,12 @@ def _extract_document_metadata(
     lines = visual_lines if visual_lines is not None else _word_runs_on_visual_baselines(page)
     excluded_bboxes: list[list[float]] = []
     for table in tables:
+        # A weak OCR reconstruction can omit or misplace individual row boxes.
+        # Exclude the enclosing source-table region as a final safeguard so
+        # item/header text inside that region cannot leak into document metadata.
+        source_bbox = table.get("source_bbox")
+        if source_bbox and len(source_bbox) == 4:
+            excluded_bboxes.append([float(value) for value in source_bbox])
         # Prefer individually located header rows/fragments when supplied. This
         # excludes actual header text (including stacked units) without swallowing
         # unrelated metadata just above or below the item table.
@@ -2620,6 +2989,16 @@ def _extract_document_metadata(
                 continue
             cleaned_label = _clean_cell(label).strip(" :\t–—-")
             cleaned_value = _clean_cell(value)
+            footer_uri = f"{cleaned_label}:{cleaned_value}"
+            if (
+                page_height > 0
+                and line_bbox[1] >= page_height * 0.82
+                and re.match(r"^(?:about|https?|ftp|file):", footer_uri, re.IGNORECASE)
+            ):
+                # Browser/print pipelines can stamp a page URL such as
+                # about:blank into the lower margin. It is a page artifact,
+                # not document metadata.
+                continue
             key = (cleaned_label.casefold(), cleaned_value.casefold(), round(float(line["y"])))
             if key in seen:
                 continue
@@ -2730,6 +3109,167 @@ def _public_summary_items(candidates: list[dict[str, Any]], data_bottom: float |
     return results
 
 
+def _detach_ocr_summary_candidates_from_item_rows(
+    page: Any,
+    tables: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    data_bottom: float | None,
+) -> float | None:
+    """Separate a positioned summary accidentally absorbed into the last OCR row.
+
+    OCR line grouping can extend the last item's description box into a separate
+    label/amount line below the item sequence. Detach only when the summary is
+    geometrically inside that row, below its independently recognized item
+    identifier, and its exact label/value text is present in a cell. No summary
+    text or amount is inferred or rewritten.
+    """
+    if not getattr(page, "ocr_word_count", 0):
+        return data_bottom
+    page_items = [item for item in getattr(page, "items", []) if isinstance(item, dict)]
+
+    def normalized_identifier(value: Any) -> str:
+        return _clean_cell(value).strip().rstrip(".)").casefold()
+
+    def remove_summary_phrase(text: str, label: str, value: str) -> str | None:
+        label_words = r"\s+".join(re.escape(part) for part in label.split())
+        value_pattern = re.escape(value.strip())
+        pattern = re.compile(
+            rf"(?<![\w]){label_words}\s*[:：]?\s*{value_pattern}(?![\w])",
+            re.IGNORECASE,
+        )
+        cleaned, replacements = pattern.subn(" ", text, count=1)
+        if not replacements:
+            return None
+        return _clean_cell(cleaned).strip(" :：")
+
+    for candidate in candidates:
+        summary_bbox = candidate.get("source_bbox")
+        if not isinstance(summary_bbox, (list, tuple)) or len(summary_bbox) != 4:
+            continue
+        try:
+            summary_box = [float(value) for value in summary_bbox]
+            summary_y = float(candidate["_y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if summary_box[2] <= summary_box[0] or summary_box[3] <= summary_box[1]:
+            continue
+
+        for table in tables:
+            if table.get("table_role", "line_items") == "document_header":
+                continue
+            rows = table.get("rows")
+            row_boxes = table.get("row_source_bboxes") or []
+            if not isinstance(rows, list) or not rows:
+                continue
+            overlapping_rows = [
+                row_index for row_index, row_box in enumerate(row_boxes[:len(rows)])
+                if isinstance(row_box, (list, tuple)) and len(row_box) == 4
+                and _bbox_intersects(summary_box, [float(value) for value in row_box])
+            ]
+            if not overlapping_rows:
+                continue
+
+            # Summary text is only detached from the final source row, and only
+            # when the OCR identifier on that row proves the summary is on a
+            # later baseline. This leaves same-line item descriptions intact.
+            row_index = max(overlapping_rows)
+            row = rows[row_index]
+            if not isinstance(row, (list, tuple)) or not row or not _is_item_identifier(_clean_cell(row[0])):
+                continue
+            row_box = row_boxes[row_index]
+            identifier = normalized_identifier(row[0])
+            identifier_cell_boxes = table.get("cell_source_bboxes") or []
+            identifier_box = (
+                identifier_cell_boxes[row_index][0]
+                if row_index < len(identifier_cell_boxes)
+                and identifier_cell_boxes[row_index]
+                else None
+            )
+            id_matches: list[dict[str, Any]] = []
+            for item in page_items:
+                if normalized_identifier(item.get("text", "")) != identifier:
+                    continue
+                try:
+                    item_box = [float(item[key]) for key in ("x0", "y0", "x1", "y1")]
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not _bbox_intersects(item_box, [float(value) for value in row_box]):
+                    continue
+                if (
+                    isinstance(identifier_box, (list, tuple))
+                    and len(identifier_box) == 4
+                    and not _bbox_intersects(item_box, [float(value) for value in identifier_box])
+                ):
+                    continue
+                id_matches.append({"bbox": item_box, "text": item.get("text", "")})
+            if not id_matches:
+                continue
+            id_word = min(id_matches, key=lambda item: float(item["bbox"][0]))
+            id_bbox = id_word["bbox"]
+            id_height = max(1.0, id_bbox[3] - id_bbox[1])
+            if summary_y <= id_bbox[3] + max(3.0, id_height * 0.55):
+                continue
+
+            label, value = str(candidate.get("label", "")).strip(), str(candidate.get("value", "")).strip()
+            if not label or not value:
+                continue
+            values = list(row)
+            cell_boxes = table.get("cell_source_bboxes") or []
+            changed_columns: list[int] = []
+            for column_index, cell in enumerate(values):
+                cell_box = (
+                    cell_boxes[row_index][column_index]
+                    if row_index < len(cell_boxes) and column_index < len(cell_boxes[row_index])
+                    else row_box
+                )
+                if not isinstance(cell_box, (list, tuple)) or len(cell_box) != 4:
+                    continue
+                if not _bbox_intersects(summary_box, [float(value) for value in cell_box]):
+                    continue
+                cleaned = remove_summary_phrase(_clean_cell(cell), label, value)
+                if cleaned is None:
+                    continue
+                values[column_index] = cleaned
+                changed_columns.append(column_index)
+            if not changed_columns:
+                continue
+
+            if isinstance(row, tuple):
+                rows[row_index] = tuple(values)
+            else:
+                rows[row_index] = values
+            new_bottom = max(float(row_box[1]), summary_box[1] - 1.0)
+            row_boxes[row_index] = [*map(float, row_box[:3]), new_bottom]
+            table["row_source_bboxes"] = row_boxes
+            for box_collection_name in ("cell_source_bboxes", "row_band_bboxes"):
+                box_collection = table.get(box_collection_name) or []
+                if row_index >= len(box_collection):
+                    continue
+                row_cells = box_collection[row_index]
+                if not isinstance(row_cells, list):
+                    continue
+                for column_index in changed_columns:
+                    if column_index >= len(row_cells):
+                        continue
+                    cell_box = row_cells[column_index]
+                    if isinstance(cell_box, (list, tuple)) and len(cell_box) == 4:
+                        row_cells[column_index] = [
+                            float(cell_box[0]), float(cell_box[1]), float(cell_box[2]),
+                            min(float(cell_box[3]), new_bottom),
+                        ]
+                box_collection[row_index] = row_cells
+                table[box_collection_name] = box_collection
+            source_box = table.get("source_bbox")
+            if isinstance(source_box, (list, tuple)) and len(source_box) == 4:
+                table["source_bbox"] = [
+                    float(source_box[0]), float(source_box[1]), float(source_box[2]),
+                    min(float(source_box[3]), new_bottom),
+                ]
+            data_bottom = new_bottom if data_bottom is None else min(data_bottom, new_bottom)
+            break
+    return data_bottom
+
+
 def _ocr_confidence_for_bbox(page: Any, bbox: Any) -> float | None:
     """Average confidences of OCR word boxes intersecting a source region."""
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
@@ -2755,6 +3295,110 @@ def _ocr_confidence_for_bbox(page: Any, bbox: Any) -> float | None:
         if min(x1, ix1) > max(x0, ix0) and min(y1, iy1) > max(y0, iy0):
             confidences.append(max(0.0, min(1.0, confidence)))
     return round(sum(confidences) / len(confidences), 4) if confidences else None
+
+
+def _ocr_cell_evidence(page: Any, bbox: Any, final_value: Any) -> dict[str, Any]:
+    """Keep the OCR words and confidence associated with one extracted cell.
+
+    This is provenance only: the OCR text is never substituted into the final
+    table value here.  In particular, punctuation-only OCR tokens are retained
+    and an empty OCR region is reported as ``no_text_detected`` rather than
+    being presented as proof that the source cell is physically blank.
+    """
+    try:
+        x0, y0, x1, y1 = (float(value) for value in bbox)
+    except (TypeError, ValueError):
+        x0 = y0 = x1 = y1 = 0.0
+    valid_bbox = x1 > x0 and y1 > y0
+    raw_words: list[dict[str, Any]] = []
+    if valid_bbox:
+        for item in getattr(page, "items", []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("raw_text", item.get("text", "")))
+            if not text.strip():
+                continue
+            try:
+                ix0, iy0 = float(item["x0"]), float(item["y0"])
+                ix1, iy1 = float(item["x1"]), float(item["y1"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if min(x1, ix1) <= max(x0, ix0) or min(y1, iy1) <= max(y0, iy0):
+                continue
+            raw_words.append({
+                "text": text,
+                "confidence": item.get("confidence"),
+                "source_bbox": [round(ix0, 2), round(iy0, 2), round(ix1, 2), round(iy1, 2)],
+                "_order": ((iy0 + iy1) / 2.0, ix0),
+            })
+    raw_words.sort(key=lambda word: word["_order"])
+    for word in raw_words:
+        word.pop("_order", None)
+
+    raw_text = " ".join(word["text"] for word in raw_words)
+    confidences: list[float] = []
+    for word in raw_words:
+        try:
+            confidence = float(word["confidence"])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(confidence):
+            confidences.append(max(0.0, min(1.0, confidence)))
+    mean_confidence = (
+        round(sum(confidences) / len(confidences), 4) if confidences else None
+    )
+    final_text = _clean_cell(final_value)
+    raw_present = bool(raw_text.strip())
+    final_present = bool(final_text)
+    if not valid_bbox:
+        status = "bbox_unavailable"
+    elif not raw_present and not final_present:
+        status = "no_text_detected"
+    elif not raw_present:
+        status = "no_direct_ocr_word"
+    elif not final_present:
+        status = "ocr_text_not_assigned"
+    elif _clean_cell(raw_text) != final_text:
+        status = "final_value_differs_from_raw_ocr"
+    else:
+        status = "recognized"
+    return {
+        "raw_text": raw_text,
+        "words": raw_words,
+        "confidence": mean_confidence,
+        "status": status,
+        "source_bbox": [round(value, 2) for value in (x0, y0, x1, y1)] if valid_bbox else None,
+        "final_value": final_text,
+        # OCR absence cannot prove a physically empty source cell. Keep that
+        # distinction explicit so callers do not mistake missing recognition
+        # for a verified blank.
+        "blankness": "unknown" if not final_present else None,
+    }
+
+
+def _attach_ocr_cell_evidence(page: Any, table: dict[str, Any]) -> None:
+    """Attach raw OCR provenance after all table value recovery/validation."""
+    rows = table.get("rows")
+    if not isinstance(rows, list):
+        return
+    count = max(
+        int(table.get("column_count") or 0),
+        max((len(row) for row in rows if isinstance(row, (list, tuple))), default=0),
+    )
+    boxes = table.get("cell_source_bboxes") or []
+    evidence: list[list[dict[str, Any]]] = []
+    for row_index, row in enumerate(rows):
+        values = list(row) if isinstance(row, (list, tuple)) else []
+        cell_boxes = boxes[row_index] if row_index < len(boxes) else []
+        evidence.append([
+            _ocr_cell_evidence(
+                page,
+                cell_boxes[column_index] if column_index < len(cell_boxes) else None,
+                values[column_index] if column_index < len(values) else "",
+            )
+            for column_index in range(count)
+        ])
+    table["cell_ocr_data"] = evidence
 
 
 def _has_ocr_text_in_bbox(page: Any, bbox: Any) -> bool:
@@ -2801,6 +3445,23 @@ def _annotate_ocr_table_review(page: Any, table: dict[str, Any]) -> None:
     issues: list[dict[str, Any]] = []
     row_bboxes = table.get("row_source_bboxes") or []
     cell_bboxes = table.get("cell_source_bboxes") or []
+
+    numeric_lane_columns: set[int] = set()
+    for column_index in range(column_count):
+        column_values = [
+            _clean_cell(row[column_index])
+            for row in rows
+            if isinstance(row, (list, tuple))
+            and column_index < len(row)
+            and _clean_cell(row[column_index])
+        ]
+        numeric_count = sum(_is_numeric_token(value) for value in column_values)
+        if (
+            len(column_values) >= 5
+            and numeric_count >= 4
+            and numeric_count / len(column_values) >= 0.70
+        ):
+            numeric_lane_columns.add(column_index)
 
     if not table.get("header_detected"):
         for row_index in range(len(rows)):
@@ -2854,6 +3515,41 @@ def _annotate_ocr_table_review(page: Any, table: dict[str, Any]) -> None:
                     "column_index": column_index,
                     "source_bbox": bbox,
                 })
+            elif not value and column_index in numeric_lane_columns:
+                # A blank in a lane that is numeric in the overwhelming
+                # majority of neighboring rows is a possible missed OCR cell.
+                # Keep it blank unless an independent repeated relationship
+                # can recover it; always expose the uncertainty for review.
+                flags[column_index] = True
+                row_flags[row_index] = True
+                if "possible_missing_numeric_cell" not in row_reasons[row_index]:
+                    row_reasons[row_index].append("possible_missing_numeric_cell")
+                issues.append({
+                    "code": "possible_missing_numeric_cell",
+                    "message": "Sel kosong berada pada kolom yang umumnya berisi angka; cocokkan dengan PDF sumber.",
+                    "row_index": row_index,
+                    "column_index": column_index,
+                    "source_bbox": bbox or (row_bboxes[row_index] if row_index < len(row_bboxes) else None),
+                })
+            elif value and column_index in numeric_lane_columns:
+                numeric_tokens = _NUMERIC_TOKEN_RE.findall(value)
+                has_letters = bool(re.search(r"[A-Za-zÀ-ž]", value))
+                if has_letters or len(numeric_tokens) > 1:
+                    flags[column_index] = True
+                    row_flags[row_index] = True
+                    if "unexpected_text_in_numeric_lane" not in row_reasons[row_index]:
+                        row_reasons[row_index].append("unexpected_text_in_numeric_lane")
+                    issues.append({
+                        "code": "unexpected_text_in_numeric_lane",
+                        "message": (
+                            "Sel berada pada kolom yang biasanya berisi satu angka, tetapi OCR menghasilkan "
+                            "teks atau beberapa angka; periksa kemungkinan nilai bergeser atau tergabung."
+                        ),
+                        "row_index": row_index,
+                        "column_index": column_index,
+                        "value": value,
+                        "source_bbox": bbox or (row_bboxes[row_index] if row_index < len(row_bboxes) else None),
+                    })
             elif confidence is not None and confidence < 0.75:
                 flags[column_index] = True
                 row_flags[row_index] = True
@@ -2964,6 +3660,364 @@ def _annotate_ocr_table_review(page: Any, table: dict[str, Any]) -> None:
     table["validation_status"] = "needs_review" if table["review_required"] else "no_detected_anomalies"
 
 
+def _recover_missing_ocr_text_line_from_geometry(page: Any, table: dict[str, Any]) -> None:
+    """Recover a missed first text line when the rest of the row proves its lane.
+
+    A small crop is attempted only when a text-dense cell already has OCR text
+    on a lower baseline, the same row has aligned OCR anchors on both sides of
+    that text lane, and the anchor baseline is otherwise empty. Column lanes
+    come from neighboring observed cell words and headers; no document schema
+    or fixed column position is assumed.
+    """
+    rows = table.get("rows")
+    items = getattr(page, "items", None)
+    row_boxes = table.get("row_source_bboxes") or []
+    if not isinstance(rows, list) or not isinstance(items, list) or len(rows) < 3:
+        return
+    column_count = max(
+        int(table.get("column_count") or 0),
+        max((len(row) for row in rows if isinstance(row, (list, tuple))), default=0),
+    )
+    if column_count < 3:
+        return
+
+    def valid_box(box: Any) -> bool:
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            return False
+        try:
+            x0, y0, x1, y1 = (float(value) for value in box)
+        except (TypeError, ValueError):
+            return False
+        return x1 > x0 and y1 > y0
+
+    def box_of(item: Any) -> tuple[float, float, float, float] | None:
+        try:
+            box = tuple(float(item[key]) for key in ("x0", "y0", "x1", "y1"))
+        except (KeyError, TypeError, ValueError):
+            return None
+        return box if box[2] > box[0] and box[3] > box[1] else None
+
+    def compact(value: Any) -> str:
+        return "".join(re.findall(r"[a-z0-9]+", _clean_cell(value).casefold()))
+
+    def token_set(value: Any) -> set[str]:
+        return set(re.findall(r"[a-z0-9]+", _clean_cell(value).casefold()))
+
+    def cell_token_count(value: Any) -> int:
+        return len(re.findall(r"\S+", _clean_cell(value)))
+
+    items_by_row: list[list[tuple[tuple[float, ...], Any]]] = []
+    for row_index in range(len(rows)):
+        row_items: list[tuple[tuple[float, ...], Any]] = []
+        row_box = row_boxes[row_index] if row_index < len(row_boxes) else None
+        if valid_box(row_box):
+            normalized_row_box = tuple(float(value) for value in row_box)
+            for item in items:
+                box = box_of(item)
+                if box is not None and _bbox_overlap_ratio(box, normalized_row_box) >= 0.10:
+                    row_items.append((box, item))
+        items_by_row.append(row_items)
+
+    # Long, repeated cell text is inferred from the extracted rows themselves.
+    # If multiple columns are similarly text-dense, the geometry is ambiguous.
+    density: list[tuple[float, float, int]] = []
+    for column_index in range(column_count):
+        counts = [
+            cell_token_count(row[column_index])
+            for row in rows
+            if isinstance(row, (list, tuple)) and column_index < len(row)
+            and _clean_cell(row[column_index])
+        ]
+        if counts:
+            density.append((sum(counts) / len(counts), float(median(counts)), column_index))
+    density.sort(reverse=True)
+    if not density:
+        return
+    mean_density, median_density, text_column = density[0]
+    runner_up = density[1][0] if len(density) > 1 else 0.0
+    if median_density < 3 or mean_density < max(3.0, runner_up * 1.5):
+        return
+    if text_column == 0 or text_column == column_count - 1:
+        return
+
+    numeric_lane_columns: set[int] = set()
+    for column_index in range(text_column + 1, column_count):
+        values = [
+            _clean_cell(row[column_index])
+            for row in rows
+            if isinstance(row, (list, tuple)) and column_index < len(row)
+            and _clean_cell(row[column_index])
+        ]
+        numeric_count = sum(_is_numeric_token(value) for value in values)
+        if len(values) >= 5 and numeric_count >= 4 and numeric_count / len(values) >= 0.70:
+            numeric_lane_columns.add(column_index)
+
+    header_centers: dict[int, float] = {}
+    header_boxes = table.get("header_source_bboxes") or []
+    if not header_boxes and valid_box(table.get("header_source_bbox")):
+        header_boxes = [table["header_source_bbox"]]
+    for column_index, header in enumerate(table.get("headers") or []):
+        header_tokens = token_set(header)
+        if not header_tokens:
+            continue
+        matched: list[float] = []
+        for item in items:
+            item_tokens = token_set(item.get("text", ""))
+            box = box_of(item)
+            if not box or not (header_tokens & item_tokens):
+                continue
+            if any(
+                valid_box(header_box)
+                and box[1] <= float(header_box[3]) + 2.0
+                and box[3] >= float(header_box[1]) - 2.0
+                for header_box in header_boxes
+            ):
+                matched.append((box[0] + box[2]) / 2.0)
+        if matched:
+            header_centers[column_index] = float(median(matched))
+
+    observed_lanes: dict[int, dict[int, tuple[float, ...]]] = {}
+    for column_index in (text_column - 1, text_column + 1):
+        lane_matches: dict[int, tuple[float, ...]] = {}
+        for other_index, row in enumerate(rows):
+            if (
+                other_index >= len(row_boxes)
+                or not valid_box(row_boxes[other_index])
+                or not isinstance(row, (list, tuple)) or column_index >= len(row)
+            ):
+                continue
+            expected = compact(row[column_index])
+            if not expected:
+                continue
+            row_box = tuple(float(value) for value in row_boxes[other_index])
+            candidates: list[tuple[float, float, tuple[float, ...]]] = []
+            for box, item in items_by_row[other_index]:
+                if compact(item.get("text", "")) != expected:
+                    continue
+                center_x = (box[0] + box[2]) / 2.0
+                header_center = header_centers.get(column_index)
+                distance = abs(center_x - header_center) if header_center is not None else 0.0
+                candidates.append((distance, box[0], box))
+            if candidates:
+                lane_matches[other_index] = min(candidates, key=lambda candidate: candidate[0])[2]
+        observed_lanes[column_index] = lane_matches
+
+    row_flags = table.setdefault("rows_need_review", [False] * len(rows))
+    row_reasons = table.setdefault("row_review_reasons", [[] for _ in rows])
+    cell_flags = table.setdefault(
+        "cell_review_flags", [[False] * column_count for _ in rows]
+    )
+    issues = table.setdefault("review_issues", [])
+    changed = False
+
+    for row_index, row in enumerate(rows):
+        if (
+            not isinstance(row, list) or text_column >= len(row)
+            or row_index >= len(row_boxes) or not valid_box(row_boxes[row_index])
+        ):
+            continue
+        existing_text = _clean_cell(row[text_column])
+        existing_tokens = token_set(existing_text)
+        if len(existing_tokens) < 2:
+            continue
+
+        left_boxes = [
+            box for other_index, box in observed_lanes.get(text_column - 1, {}).items()
+            if other_index != row_index
+        ]
+        right_boxes = [
+            box for other_index, box in observed_lanes.get(text_column + 1, {}).items()
+            if other_index != row_index
+        ]
+        if len(left_boxes) < 2 or len(right_boxes) < 2:
+            continue
+        left_edge = float(median(box[2] for box in left_boxes))
+        right_edge = float(median(box[0] for box in right_boxes))
+        if right_edge - left_edge < 40.0:
+            continue
+        # A small geometry margin avoids clipping glyph edges while staying
+        # outside the neighboring observed lanes.
+        margin = min(3.0, max(1.0, (right_edge - left_edge) * 0.005))
+        text_left, text_right = left_edge + margin, right_edge - margin
+
+        row_box = tuple(float(value) for value in row_boxes[row_index])
+        row_items = items_by_row[row_index]
+        if len(row_items) < 3:
+            continue
+
+        # Cluster observed words by baseline center, retaining boxes for a
+        # tight local crop. OCR boxes from a single line may vary slightly in y.
+        baselines: list[list[tuple[tuple[float, ...], Any]]] = []
+        for entry in sorted(row_items, key=lambda pair: (pair[0][1] + pair[0][3]) / 2.0):
+            center_y = (entry[0][1] + entry[0][3]) / 2.0
+            if baselines:
+                prior_y = median((box[1] + box[3]) / 2.0 for box, _ in baselines[-1])
+            else:
+                prior_y = None
+            if prior_y is None or abs(center_y - prior_y) > 3.5:
+                baselines.append([entry])
+            else:
+                baselines[-1].append(entry)
+
+        for baseline_index, baseline in enumerate(baselines):
+            centers = [(box[0] + box[2]) / 2.0 for box, _ in baseline]
+            left_anchors = [entry for entry in baseline if (entry[0][0] + entry[0][2]) / 2.0 < text_left]
+            right_anchors = [entry for entry in baseline if (entry[0][0] + entry[0][2]) / 2.0 > text_right]
+            text_words = [
+                entry for entry in baseline
+                if text_left <= (entry[0][0] + entry[0][2]) / 2.0 <= text_right
+            ]
+            if len(centers) < 3 or not left_anchors or not right_anchors or text_words:
+                continue
+
+            baseline_y = median((box[1] + box[3]) / 2.0 for box, _ in baseline)
+            continuation_tokens: set[str] = set()
+            for later_baseline in baselines[baseline_index + 1:]:
+                later_y = median((box[1] + box[3]) / 2.0 for box, _ in later_baseline)
+                if later_y <= baseline_y + 4.0:
+                    continue
+                for box, item in later_baseline:
+                    center_x = (box[0] + box[2]) / 2.0
+                    if text_left <= center_x <= text_right:
+                        continuation_tokens.update(token_set(item.get("text", "")))
+            if len(existing_tokens & continuation_tokens) < min(2, len(existing_tokens)):
+                continue
+
+            anchor_boxes = [box for box, _ in baseline]
+            crop_box = [
+                round(text_left, 3),
+                max(row_box[1], min(box[1] for box in anchor_boxes) - 0.5),
+                round(text_right, 3),
+                min(row_box[3], max(box[3] for box in anchor_boxes) + 0.5),
+            ]
+            if crop_box[3] - crop_box[1] < 5.0:
+                continue
+
+            try:
+                from backend.services.ocr_adapter import recognize_ocr_text_line_crop
+
+                reading = recognize_ocr_text_line_crop(page, crop_box)
+            except Exception:
+                reading = None
+            recovered_line = _clean_cell(reading.get("text")) if isinstance(reading, dict) else ""
+            try:
+                confidence = float(reading.get("confidence")) if isinstance(reading, dict) else 0.0
+            except (TypeError, ValueError):
+                confidence = 0.0
+            recovered_tokens = token_set(recovered_line)
+            duplicate_ratio = (
+                len(recovered_tokens & existing_tokens) / len(recovered_tokens)
+                if recovered_tokens else 1.0
+            )
+            accepted = bool(recovered_line and confidence >= 0.90 and duplicate_ratio < 0.70)
+            raw_text = row[text_column]
+            if accepted:
+                row[text_column] = _clean_cell(f"{recovered_line} {existing_text}")
+                changed = True
+
+                # The same missed baseline can also hide a value in a numeric
+                # lane next to the text column. Probe only blank, statistically
+                # numeric lanes whose x-position is independently observed in
+                # neighboring rows, and accept only a clean high-confidence
+                # single-number reading.
+                for numeric_column in sorted(numeric_lane_columns):
+                    if numeric_column >= len(row) or _clean_cell(row[numeric_column]):
+                        continue
+                    numeric_lane = observed_lanes.get(numeric_column)
+                    if not numeric_lane or len(numeric_lane) < 2:
+                        continue
+                    lane_boxes = list(numeric_lane.values())
+                    lane_left = float(median(box[0] for box in lane_boxes))
+                    lane_right = float(median(box[2] for box in lane_boxes))
+                    if lane_right <= lane_left:
+                        continue
+                    lane_padding = min(1.5, max(0.5, (lane_right - lane_left) * 0.04))
+                    numeric_crop = [
+                        max(float(getattr(getattr(page, "rect", None), "x0", 0.0)), lane_left - lane_padding),
+                        crop_box[1],
+                        min(float(getattr(getattr(page, "rect", None), "x1", lane_right)), lane_right + lane_padding),
+                        crop_box[3],
+                    ]
+                    try:
+                        numeric_reading = recognize_ocr_text_line_crop(page, numeric_crop)
+                    except Exception:
+                        numeric_reading = None
+                    if not isinstance(numeric_reading, dict):
+                        continue
+                    numeric_text = _clean_cell(numeric_reading.get("text"))
+                    try:
+                        numeric_confidence = float(numeric_reading.get("confidence"))
+                    except (TypeError, ValueError):
+                        continue
+                    numeric_tokens = re.findall(
+                        r"(?<![A-Za-z0-9])[-+]?\d[\d,]*(?:\.\d+)?(?![A-Za-z0-9])",
+                        numeric_text,
+                    )
+                    remainder = numeric_text
+                    if len(numeric_tokens) == 1:
+                        remainder = remainder.replace(numeric_tokens[0], "", 1)
+                    if (
+                        len(numeric_tokens) != 1 or numeric_confidence < 0.95
+                        or re.search(r"[A-Za-z0-9]", remainder)
+                        or not _is_numeric_token(numeric_tokens[0])
+                    ):
+                        continue
+                    row[numeric_column] = numeric_tokens[0]
+                    cell_flags[row_index][numeric_column] = True
+                    numeric_reason = "ocr_numeric_cell_recovered"
+                    if numeric_reason not in row_reasons[row_index]:
+                        row_reasons[row_index].append(numeric_reason)
+                    issues.append({
+                        "code": numeric_reason,
+                        "message": (
+                            f"Nilai numerik kosong dibaca ulang dari crop kolom yang teramati "
+                            f"(confidence {numeric_confidence:.0%}); cocokkan dengan PDF asli."
+                        ),
+                        "row_index": row_index,
+                        "column_index": numeric_column,
+                        "raw_ocr_value": "",
+                        "recovered_value": numeric_tokens[0],
+                        "confidence": numeric_confidence,
+                        "source_bbox": row_box,
+                        "crop_bbox": numeric_crop,
+                    })
+                    table["review_required"] = True
+                    table["validation_status"] = "needs_review"
+
+            while row_index >= len(cell_flags):
+                cell_flags.append([False] * column_count)
+            while len(cell_flags[row_index]) < column_count:
+                cell_flags[row_index].append(False)
+            row_flags[row_index] = True
+            cell_flags[row_index][text_column] = True
+            reason = "ocr_text_line_recovered" if accepted else "possible_missing_ocr_text_line"
+            if reason not in row_reasons[row_index]:
+                row_reasons[row_index].append(reason)
+            issues.append({
+                "code": reason,
+                "message": (
+                    f"Baris teks yang terlewat dibaca ulang dari crop sumber (confidence {confidence:.0%}); "
+                    "cocokkan dengan PDF asli."
+                    if accepted else
+                    "Geometri menunjukkan kemungkinan baris teks terlewat, tetapi crop OCR tidak cukup yakin; "
+                    "teks yang sudah terbaca dipertahankan dan baris perlu diperiksa."
+                ),
+                "row_index": row_index,
+                "column_index": text_column,
+                "raw_ocr_value": raw_text,
+                "recovered_line": recovered_line or None,
+                "confidence": confidence if reading else None,
+                "source_bbox": row_box,
+                "crop_bbox": crop_box,
+            })
+            table["review_required"] = True
+            table["validation_status"] = "needs_review"
+            break
+
+    if changed:
+        table["row_count"] = len(rows)
+
+
 def _normalize_confusable_numeric_ocr_cells(page: Any, table: dict[str, Any]) -> None:
     """Correct narrow OCR digit confusions only inside observed numeric columns.
 
@@ -3004,6 +4058,14 @@ def _normalize_confusable_numeric_ocr_cells(page: Any, table: dict[str, Any]) ->
                 continue
             original = _clean_cell(row[column_index])
             recovered = _ocr_numeric_recovery_candidate(original)
+            if (
+                recovered is None
+                and original.strip(_OCR_NUMERIC_EDGE_QUOTES).casefold() == "s"
+            ):
+                # A standalone OCR ``s`` is a common 5/S shape confusion. Only
+                # accept it here, after the surrounding column has independently
+                # met the numeric-lane threshold and a source cell bbox exists.
+                recovered = "5"
             if recovered is None:
                 continue
             bbox = (
@@ -3050,9 +4112,1087 @@ def _normalize_confusable_numeric_ocr_cells(page: Any, table: dict[str, Any]) ->
         row_flags[row_index] = True
         if "ocr_numeric_confusable_normalized" not in row_reasons[row_index]:
             row_reasons[row_index].append("ocr_numeric_confusable_normalized")
-    table.setdefault("review_issues", []).extend(normalizations)
+    issues = table.setdefault("review_issues", [])
+    for item in normalizations:
+        prior_unexpected_text = next((
+            issue for issue in issues
+            if issue.get("code") == "unexpected_text_in_numeric_lane"
+            and issue.get("row_index") == item["row_index"]
+            and issue.get("column_index") == item["column_index"]
+        ), None)
+        if prior_unexpected_text is not None:
+            prior_unexpected_text.clear()
+            prior_unexpected_text.update(item)
+        else:
+            issues.append(item)
     table["review_required"] = True
     table["validation_status"] = "needs_review"
+
+
+def _stamp_numeric_cell_crop_bbox(
+    table: dict[str, Any], row_index: int, column_index: int, page: Any = None,
+) -> list[float] | None:
+    """Estimate the interior of a stamp-hit numeric cell from neighboring rows."""
+    rows = table.get("rows") or []
+    cell_boxes = table.get("cell_source_bboxes") or []
+    row_boxes = table.get("row_source_bboxes") or []
+    current_box = (
+        cell_boxes[row_index][column_index]
+        if row_index < len(cell_boxes)
+        and column_index < len(cell_boxes[row_index])
+        else None
+    )
+
+    def valid_box(box: Any) -> bool:
+        return (
+            isinstance(box, (list, tuple)) and len(box) == 4
+            and float(box[2]) > float(box[0])
+            and float(box[3]) > float(box[1])
+        )
+
+    if not valid_box(current_box):
+        return _stamp_numeric_crop_bbox_from_ocr_lanes(
+            page, table, row_index, column_index, valid_box
+        )
+    centers_by_column: dict[int, list[float]] = {}
+    for column in (column_index - 1, column_index, column_index + 1):
+        centers = []
+        for other_row in range(len(rows)):
+            if other_row == row_index or other_row >= len(cell_boxes):
+                continue
+            if column >= len(cell_boxes[other_row]):
+                continue
+            box = cell_boxes[other_row][column]
+            if valid_box(box):
+                centers.append((float(box[0]) + float(box[2])) / 2.0)
+        if centers:
+            centers_by_column[column] = centers
+
+    if column_index in centers_by_column:
+        center_x = float(median(centers_by_column[column_index]))
+    else:
+        center_x = (float(current_box[0]) + float(current_box[2])) / 2.0
+    left_neighbor = centers_by_column.get(column_index - 1, [])
+    right_neighbor = centers_by_column.get(column_index + 1, [])
+    left = (
+        (float(median(left_neighbor)) + center_x) / 2.0
+        if left_neighbor else float(current_box[0])
+    )
+    right = (
+        (center_x + float(median(right_neighbor))) / 2.0
+        if right_neighbor else float(current_box[2])
+    )
+    if right <= left:
+        return None
+
+    def vertical_center(box: Any) -> float:
+        return (float(box[1]) + float(box[3])) / 2.0
+
+    previous_centers = [
+        vertical_center(cell_boxes[index][column_index])
+        for index in range(min(row_index, len(cell_boxes)) - 1, -1, -1)
+        if column_index < len(cell_boxes[index])
+        and valid_box(cell_boxes[index][column_index])
+    ]
+    next_centers = [
+        vertical_center(cell_boxes[index][column_index])
+        for index in range(row_index + 1, len(cell_boxes))
+        if column_index < len(cell_boxes[index])
+        and valid_box(cell_boxes[index][column_index])
+    ]
+    if previous_centers and next_centers:
+        previous_y, next_y = previous_centers[0], next_centers[0]
+        current_y = (previous_y + next_y) / 2.0
+        top = (previous_y + current_y) / 2.0 + 0.4
+        bottom = (current_y + next_y) / 2.0 - 0.4
+    else:
+        row_box = row_boxes[row_index] if row_index < len(row_boxes) else current_box
+        if not valid_box(row_box):
+            row_box = current_box
+        inset = min(2.0, max(0.5, (float(row_box[3]) - float(row_box[1])) * 0.12))
+        top, bottom = float(row_box[1]) + inset, float(row_box[3]) - inset
+    if bottom <= top:
+        return None
+    return [round(left, 3), round(top, 3), round(right, 3), round(bottom, 3)]
+
+
+def _stamp_numeric_crop_bbox_from_ocr_lanes(
+    page: Any,
+    table: dict[str, Any],
+    row_index: int,
+    column_index: int,
+    valid_box: Callable[[Any], bool],
+) -> list[float] | None:
+    """Infer a missing cell box from repeated word positions in neighboring rows."""
+    rows = table.get("rows") or []
+    row_boxes = table.get("row_source_bboxes") or []
+    items = getattr(page, "items", None)
+    if (
+        not isinstance(items, list) or row_index >= len(row_boxes)
+        or not valid_box(row_boxes[row_index])
+    ):
+        return None
+
+    def normalize(value: Any) -> str:
+        return re.sub(r"\s+", "", _clean_cell(value)).casefold()
+
+    def center_x(box: Any) -> float:
+        return (float(box[0]) + float(box[2])) / 2.0
+
+    def center_y(box: Any) -> float:
+        return (float(box[1]) + float(box[3])) / 2.0
+
+    headers = table.get("headers") or []
+    header_boxes = table.get("header_source_bboxes") or []
+    if not header_boxes and valid_box(table.get("header_source_bbox")):
+        header_boxes = [table["header_source_bbox"]]
+    header_centers: dict[int, float] = {}
+    for lane, header in enumerate(headers):
+        header_tokens = set(re.findall(r"[a-z0-9]+", _clean_cell(header).casefold()))
+        if not header_tokens:
+            continue
+        matched_words: list[Any] = []
+        for word in items:
+            word_tokens = set(re.findall(r"[a-z0-9]+", str(word.get("text", "")).casefold()))
+            if not (word_tokens & header_tokens):
+                continue
+            try:
+                word_box = [float(word[key]) for key in ("x0", "y0", "x1", "y1")]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if any(
+                valid_box(box)
+                and word_box[1] <= float(box[3]) + 2.0
+                and word_box[3] >= float(box[1]) - 2.0
+                for box in header_boxes
+            ):
+                matched_words.append(word_box)
+        if matched_words:
+            header_centers[lane] = median(
+                (float(box[0]) + float(box[2])) / 2.0 for box in matched_words
+            )
+
+    lane_matches: dict[int, list[tuple[float, float, int, float]]] = {}
+    for lane in (column_index - 1, column_index, column_index + 1):
+        if lane < 0:
+            continue
+        matches: list[tuple[float, float, int, float]] = []
+        for other_row, values in enumerate(rows):
+            if (
+                other_row == row_index or other_row >= len(row_boxes)
+                or not valid_box(row_boxes[other_row])
+                or not isinstance(values, (list, tuple)) or lane >= len(values)
+            ):
+                continue
+            expected = normalize(values[lane])
+            if not expected:
+                continue
+            row_box = row_boxes[other_row]
+            row_y = center_y(row_box)
+            tolerance_y = max(5.0, (float(row_box[3]) - float(row_box[1])) * 0.60)
+            candidates: list[tuple[float, float, float, float]] = []
+            for word in items:
+                if normalize(word.get("text", "")) != expected:
+                    continue
+                try:
+                    word_box = [float(word[key]) for key in ("x0", "y0", "x1", "y1")]
+                    confidence = float(word.get("confidence", 1.0))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (
+                    word_box[2] <= word_box[0] or word_box[3] <= word_box[1]
+                    or confidence < 0.75
+                ):
+                    continue
+                word_y = center_y(word_box)
+                if abs(word_y - row_y) > tolerance_y:
+                    continue
+                candidates.append((
+                    abs(word_y - row_y), center_x(word_box),
+                    word_box[2] - word_box[0], confidence,
+                ))
+            if candidates:
+                # One reading per row prevents repeated tokens in a cell from
+                # giving a single row extra weight in the geometric lane.
+                lane_center = header_centers.get(lane)
+                if lane_center is None:
+                    _, x, width, confidence = min(candidates, key=lambda value: value[0])
+                else:
+                    _, x, width, confidence = min(
+                        candidates,
+                        key=lambda value: abs(value[1] - lane_center) * 4.0 + value[0],
+                    )
+                matches.append((x, width, other_row, confidence))
+        if not matches:
+            continue
+
+        tolerance_x = max(6.0, float(getattr(getattr(page, "rect", None), "width", 595.0)) * 0.012)
+        clusters: list[list[tuple[float, float, int, float]]] = []
+        for match in sorted(matches, key=lambda value: value[0]):
+            if clusters and abs(match[0] - median(item[0] for item in clusters[-1])) <= tolerance_x:
+                clusters[-1].append(match)
+            else:
+                clusters.append([match])
+        best_cluster = max(
+            clusters,
+            key=lambda cluster: (len({item[2] for item in cluster}), sum(item[3] for item in cluster)),
+        )
+        if len({item[2] for item in best_cluster}) >= 2:
+            lane_matches[lane] = best_cluster
+
+    target_matches = lane_matches.get(column_index)
+    if not target_matches:
+        return None
+    x_center = float(header_centers.get(
+        column_index, median(item[0] for item in target_matches)
+    ))
+    median_width = float(median(item[1] for item in target_matches))
+    left_matches = lane_matches.get(column_index - 1, [])
+    right_matches = lane_matches.get(column_index + 1, [])
+    if column_index in header_centers:
+        lane_padding = max(3.0, median_width * 0.25)
+        left, right = x_center - median_width / 2.0 - lane_padding, x_center + median_width / 2.0 + lane_padding
+    elif left_matches:
+        left = (float(median(item[0] for item in left_matches)) + x_center) / 2.0
+    else:
+        left = x_center - max(10.0, median_width * 1.5)
+    if column_index in header_centers:
+        pass
+    elif right_matches:
+        right = (x_center + float(median(item[0] for item in right_matches))) / 2.0
+    else:
+        right = x_center + max(10.0, median_width * 1.5)
+
+    current_box = row_boxes[row_index]
+    current_y = center_y(current_box)
+    source_value = _clean_cell(rows[row_index][column_index]) if column_index < len(rows[row_index]) else ""
+    source_tokens = set(re.findall(r"[a-z0-9]+", source_value.casefold()))
+    target_words: list[tuple[tuple[float, ...], str, float]] = []
+    lane_x_tolerance = max(24.0, median_width * 1.8)
+    for word in items:
+        word_tokens = set(re.findall(r"[a-z0-9]+", str(word.get("text", "")).casefold()))
+        if not (word_tokens & source_tokens):
+            continue
+        try:
+            word_box = tuple(float(word[key]) for key in ("x0", "y0", "x1", "y1"))
+            confidence = float(word.get("confidence", 1.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            word_box[2] <= word_box[0] or word_box[3] <= word_box[1]
+            or abs(center_x(word_box) - x_center) > lane_x_tolerance
+            or _bbox_overlap_ratio(word_box, tuple(float(value) for value in current_box)) < 0.10
+        ):
+            continue
+        target_words.append((word_box, str(word.get("text", "")), confidence))
+    target_word = max(
+        target_words,
+        key=lambda item: (
+            bool(_is_numeric_token(item[1])), item[2],
+            -abs(center_x(item[0]) - x_center), -center_y(item[0]),
+        ),
+        default=None,
+    )
+    if target_word is not None:
+        target_box = target_word[0]
+        target_y = center_y(target_box)
+        y_padding = max(7.5, (float(target_box[3]) - float(target_box[1])) * 0.80)
+        top, bottom = target_y - y_padding, target_y + y_padding
+    else:
+        previous = [center_y(box) for box in row_boxes[:row_index] if valid_box(box)]
+        following = [center_y(box) for box in row_boxes[row_index + 1:] if valid_box(box)]
+        if previous and following:
+            top = (previous[-1] + current_y) / 2.0 + 0.25
+            bottom = (current_y + following[0]) / 2.0 - 0.25
+        else:
+            inset = min(2.0, max(0.5, (float(current_box[3]) - float(current_box[1])) * 0.12))
+            top, bottom = float(current_box[1]) + inset, float(current_box[3]) - inset
+
+    rect = getattr(page, "rect", None)
+    if rect is not None:
+        left = max(float(getattr(rect, "x0", 0.0)), left)
+        right = min(float(getattr(rect, "x1", getattr(rect, "width", right))), right)
+        top = max(float(getattr(rect, "y0", 0.0)), top)
+        bottom = min(float(getattr(rect, "y1", getattr(rect, "height", bottom))), bottom)
+    if right <= left or bottom <= top or right - left > 160.0 or bottom - top > 45.0:
+        return None
+    return [round(left, 3), round(top, 3), round(right, 3), round(bottom, 3)]
+
+
+def _read_stamp_occluded_numeric_value(
+    page: Any, table: dict[str, Any], row_index: int, column_index: int,
+) -> dict[str, Any] | None:
+    crop_bbox = _stamp_numeric_cell_crop_bbox(table, row_index, column_index, page)
+    if crop_bbox is None:
+        return None
+    try:
+        from backend.services.ocr_adapter import recognize_stamp_occluded_numeric_crop
+
+        reading = recognize_stamp_occluded_numeric_crop(page, crop_bbox)
+    except Exception:
+        return None
+    if not isinstance(reading, dict):
+        return None
+    raw_text = _clean_cell(reading.get("text"))
+    try:
+        confidence = float(reading.get("confidence"))
+    except (TypeError, ValueError):
+        return None
+    candidate = raw_text if _is_numeric_token(raw_text) else _ocr_numeric_recovery_candidate(raw_text)
+    agreement_count = 1
+    if candidate is None or confidence < 0.90:
+        variant_candidates: dict[str, list[float]] = {}
+        for variant in reading.get("variant_readings", []):
+            if not isinstance(variant, dict):
+                continue
+            variant_text = _clean_cell(variant.get("text"))
+            variant_candidate = (
+                variant_text if _is_numeric_token(variant_text)
+                else _ocr_numeric_recovery_candidate(variant_text)
+            )
+            try:
+                variant_confidence = float(variant.get("confidence"))
+            except (TypeError, ValueError):
+                continue
+            if variant_candidate is not None and variant_confidence >= 0.55:
+                variant_candidates.setdefault(variant_candidate, []).append(variant_confidence)
+        consensus = max(variant_candidates.items(), key=lambda item: len(item[1]), default=None)
+        if consensus is None or len(consensus[1]) < 2:
+            return None
+        candidate = consensus[0]
+        confidence = min(consensus[1])
+        agreement_count = len(consensus[1])
+    return {
+        "text": candidate,
+        "confidence": confidence,
+        "crop_bbox": crop_bbox,
+        "agreement_count": agreement_count,
+    }
+
+
+def _annotate_colored_stamp_overlaps(page: Any, table: dict[str, Any]) -> None:
+    """Flag OCR cells under possible colored seals, using row geometry as fallback."""
+    get_stamp_regions = getattr(page, "get_stamp_regions", None)
+    if not callable(get_stamp_regions):
+        return
+    rows = table.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return
+    try:
+        stamp_regions = get_stamp_regions()
+    except Exception:  # optional image analysis must not fail table extraction
+        return
+    if not stamp_regions:
+        return
+
+    column_count = max(
+        int(table.get("column_count") or 0),
+        max((len(row) for row in rows if isinstance(row, (list, tuple))), default=0),
+    )
+    cell_boxes = table.get("cell_source_bboxes") or []
+    row_boxes = table.get("row_source_bboxes") or []
+    row_flags = table.setdefault("rows_need_review", [False] * len(rows))
+    row_reasons = table.setdefault("row_review_reasons", [[] for _ in rows])
+    cell_flags = table.setdefault(
+        "cell_review_flags", [[False] * column_count for _ in rows]
+    )
+    issues = table.setdefault("review_issues", [])
+    numeric_lane_columns: set[int] = set()
+    for column_index in range(column_count):
+        values = [
+            _clean_cell(row[column_index])
+            for row in rows
+            if isinstance(row, (list, tuple))
+            and column_index < len(row)
+            and _clean_cell(row[column_index])
+        ]
+        numeric_count = sum(_is_numeric_token(value) for value in values)
+        if len(values) >= 5 and numeric_count >= 4 and numeric_count / len(values) >= 0.70:
+            numeric_lane_columns.add(column_index)
+
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)):
+            continue
+        for column_index in range(min(column_count, len(row))):
+            cell_bbox = (
+                cell_boxes[row_index][column_index]
+                if row_index < len(cell_boxes)
+                and column_index < len(cell_boxes[row_index])
+                else None
+            )
+            if not isinstance(cell_bbox, (list, tuple)) or len(cell_bbox) != 4:
+                continue
+            for stamp_bbox in stamp_regions:
+                try:
+                    overlap = _bbox_overlap_ratio(
+                        tuple(float(value) for value in cell_bbox),
+                        tuple(float(value) for value in stamp_bbox),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if overlap < 0.20:
+                    continue
+                raw_value = _clean_cell(row[column_index])
+                prior_numeric_recovery = next((
+                    issue for issue in issues
+                    if issue.get("code") == "ocr_numeric_confusable_normalized"
+                    and issue.get("row_index") == row_index
+                    and issue.get("column_index") == column_index
+                ), None)
+                prior_cell_issue = next((
+                    issue for issue in issues
+                    if issue.get("code") in {
+                        "unexpected_text_in_numeric_lane",
+                        "ocr_numeric_confusable_normalized",
+                    }
+                    and issue.get("row_index") == row_index
+                    and issue.get("column_index") == column_index
+                ), None)
+                suspicious_text = (
+                    bool(re.search(r"[A-Za-zÀ-ž]", raw_value))
+                    or prior_numeric_recovery is not None
+                )
+                attempt_recovery = column_index in numeric_lane_columns and suspicious_text
+                recovered_reading = (
+                    _read_stamp_occluded_numeric_value(page, table, row_index, column_index)
+                    if attempt_recovery else None
+                )
+                cleared_value = attempt_recovery and recovered_reading is None
+                if attempt_recovery:
+                    raw_value = str(
+                        prior_numeric_recovery.get("raw_text")
+                        if prior_numeric_recovery else raw_value
+                    )
+                    if isinstance(row, tuple):
+                        row = list(row)
+                        rows[row_index] = row
+                    if recovered_reading is not None:
+                        row[column_index] = recovered_reading["text"]
+                    else:
+                        row[column_index] = ""
+                    if prior_numeric_recovery is not None and recovered_reading is None:
+                        prior_numeric_recovery["superseded_by_stamp_review"] = True
+                        prior_numeric_recovery["message"] = (
+                            "Koreksi karakter OCR dibatalkan karena sel bertumpang-tindih dengan kemungkinan cap; "
+                            "cocokkan nilai asli dengan PDF sumber."
+                        )
+                    elif prior_numeric_recovery is not None:
+                        prior_numeric_recovery["superseded_by_stamp_reread"] = True
+                        prior_numeric_recovery["message"] = (
+                            f"Nilai terbaca ulang sebagai '{recovered_reading['text']}' setelah tinta cap dan garis "
+                            "tabel ditekan; tetap cocokkan dengan PDF sumber."
+                        )
+                while row_index >= len(cell_flags):
+                    cell_flags.append([False] * column_count)
+                while len(cell_flags[row_index]) < column_count:
+                    cell_flags[row_index].append(False)
+                cell_flags[row_index][column_index] = True
+                row_flags[row_index] = True
+                if "possible_colored_stamp_overlap" not in row_reasons[row_index]:
+                    row_reasons[row_index].append("possible_colored_stamp_overlap")
+                stamp_issue = {
+                    "code": "possible_colored_stamp_overlap",
+                    "message": (
+                        (
+                            f"Kemungkinan cap menimpa sel. Crop sel dibaca ulang sebagai "
+                            f"'{recovered_reading['text']}' (confidence {recovered_reading['confidence']:.0%}); "
+                            f"OCR awal {raw_value!r} tetap tercatat. Cocokkan hasil dengan PDF sumber."
+                        ) if recovered_reading is not None else
+                        (
+                            f"Kemungkinan cap berwarna menimpa sel pada lane angka; teks OCR {raw_value!r} "
+                            "dikeluarkan dari nilai final dan disimpan di detail indikator. Cocokkan angka "
+                            "asli dengan PDF sumber."
+                        ) if cleared_value else
+                        "Kemungkinan cap berwarna menimpa sel ini. Nilai OCR dipertahankan, tetapi cocokkan dengan PDF sumber."
+                    ),
+                    "row_index": row_index,
+                    "column_index": column_index,
+                    "value": raw_value,
+                    "raw_ocr_value": raw_value,
+                    "value_cleared": cleared_value,
+                    "value_recovered": recovered_reading is not None,
+                    "recovered_value": recovered_reading["text"] if recovered_reading else None,
+                    "recovery_confidence": recovered_reading["confidence"] if recovered_reading else None,
+                    "recovery_bbox": recovered_reading["crop_bbox"] if recovered_reading else None,
+                    "source_bbox": list(cell_bbox),
+                    "stamp_bbox": list(stamp_bbox),
+                    "overlap_ratio": round(overlap, 4),
+                }
+                if attempt_recovery and prior_cell_issue is not None:
+                    # The final cell value and its warning now describe the
+                    # stamp-aware crop read. Replace the stale generic numeric
+                    # lane warning so the UI does not imply that the recovered
+                    # cell is still blank or still contains fused OCR text.
+                    prior_cell_issue.clear()
+                    prior_cell_issue.update(stamp_issue)
+                    if not any(
+                        issue.get("row_index") == row_index
+                        and issue.get("code") == "unexpected_text_in_numeric_lane"
+                        for issue in issues
+                    ):
+                        row_reasons[row_index] = [
+                            reason for reason in row_reasons[row_index]
+                            if reason != "unexpected_text_in_numeric_lane"
+                        ]
+                else:
+                    issues.append(stamp_issue)
+                break
+
+        # Some OCR reconstruction strategies publish row boxes but no cell boxes.
+        # In that case, use overlapping OCR words to associate a stamp with a
+        # numeric-dominant output column instead of silently skipping the row.
+        row_cell_boxes = cell_boxes[row_index] if row_index < len(cell_boxes) else []
+        missing_cell_columns = {
+            column_index
+            for column_index in range(min(column_count, len(row)))
+            if column_index >= len(row_cell_boxes)
+            or not isinstance(row_cell_boxes[column_index], (list, tuple))
+            or len(row_cell_boxes[column_index]) != 4
+        }
+        if not missing_cell_columns:
+            continue
+        row_bbox = row_boxes[row_index] if row_index < len(row_boxes) else None
+        if not isinstance(row_bbox, (list, tuple)) or len(row_bbox) != 4:
+            continue
+        for stamp_bbox in stamp_regions:
+            try:
+                row_overlap = _bbox_overlap_ratio(
+                    tuple(float(value) for value in row_bbox),
+                    tuple(float(value) for value in stamp_bbox),
+                )
+            except (TypeError, ValueError):
+                continue
+            if row_overlap < 0.20:
+                continue
+
+            stamp_tokens: set[str] = set()
+            for word in getattr(page, "items", []):
+                try:
+                    word_bbox = tuple(float(word[key]) for key in ("x0", "y0", "x1", "y1"))
+                    word_text = str(word.get("text", "")).strip()
+                    in_stamp = _bbox_overlap_ratio(word_bbox, tuple(stamp_bbox)) >= 0.15
+                    in_row = _bbox_overlap_ratio(word_bbox, tuple(row_bbox)) >= 0.15
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if in_stamp and in_row:
+                    stamp_tokens.update(re.findall(r"[a-z0-9]+", word_text.casefold()))
+
+            row_flags[row_index] = True
+            if "possible_colored_stamp_overlap" not in row_reasons[row_index]:
+                row_reasons[row_index].append("possible_colored_stamp_overlap")
+            matched_columns: set[int] = set()
+            for column_index in numeric_lane_columns & missing_cell_columns:
+                if column_index >= len(row):
+                    continue
+                raw_value = _clean_cell(row[column_index])
+                value_tokens = set(re.findall(r"[a-z0-9]+", raw_value.casefold()))
+                compact_value = "".join(re.findall(r"[a-z0-9]+", raw_value.casefold()))
+                word_match = bool(value_tokens & stamp_tokens) or any(
+                    len(token) >= 3 and token in compact_value
+                    for token in stamp_tokens
+                )
+                if not word_match:
+                    continue
+                matched_columns.add(column_index)
+                prior_numeric_recovery = next((
+                    issue for issue in issues
+                    if issue.get("code") == "ocr_numeric_confusable_normalized"
+                    and issue.get("row_index") == row_index
+                    and issue.get("column_index") == column_index
+                ), None)
+                suspicious_text = (
+                    bool(re.search(r"[A-Za-zÀ-ž]", raw_value))
+                    or prior_numeric_recovery is not None
+                )
+                recovered_reading = (
+                    _read_stamp_occluded_numeric_value(page, table, row_index, column_index)
+                    if suspicious_text else None
+                )
+                cleared_value = suspicious_text and recovered_reading is None
+                prior_cell_issue = next((
+                    issue for issue in issues
+                    if issue.get("code") in {
+                        "unexpected_text_in_numeric_lane",
+                        "ocr_numeric_confusable_normalized",
+                    }
+                    and issue.get("row_index") == row_index
+                    and issue.get("column_index") == column_index
+                ), None)
+                if suspicious_text:
+                    raw_value = str(
+                        prior_numeric_recovery.get("raw_text")
+                        if prior_numeric_recovery else raw_value
+                    )
+                    if isinstance(row, tuple):
+                        row = list(row)
+                        rows[row_index] = row
+                    row[column_index] = recovered_reading["text"] if recovered_reading else ""
+                    if prior_numeric_recovery is not None:
+                        prior_numeric_recovery["superseded_by_stamp_review"] = recovered_reading is None
+                        prior_numeric_recovery["message"] = (
+                            (
+                                f"Crop sel dibaca ulang sebagai '{recovered_reading['text']}'; cocokkan nilai "
+                                "dengan PDF sumber."
+                            ) if recovered_reading else
+                            "Koreksi karakter OCR dibatalkan karena kata sumber bertumpang-tindih dengan kemungkinan cap; "
+                            "cocokkan nilai asli dengan PDF sumber."
+                        )
+                while row_index >= len(cell_flags):
+                    cell_flags.append([False] * column_count)
+                while len(cell_flags[row_index]) < column_count:
+                    cell_flags[row_index].append(False)
+                cell_flags[row_index][column_index] = True
+                stamp_issue = {
+                    "code": "possible_colored_stamp_overlap",
+                    "message": (
+                        (
+                            f"Crop numerik dibaca ulang sebagai '{recovered_reading['text']}' "
+                            f"(confidence {recovered_reading['confidence']:.0%}); OCR awal {raw_value!r} "
+                            "tetap tersimpan. Cocokkan dengan PDF sumber."
+                        ) if recovered_reading else
+                        f"Kata OCR pada area cap cocok dengan sel lane angka ({raw_value!r}); "
+                        + (
+                            "teks dikeluarkan dari nilai final dan dipertahankan pada indikator. "
+                            if cleared_value else "nilai dipertahankan tetapi harus diperiksa. "
+                        )
+                        + "Geometri sel tidak tersedia, jadi posisi sel ditautkan melalui baris dan kata OCR sumber."
+                    ),
+                    "row_index": row_index,
+                    "column_index": column_index,
+                    "value": raw_value,
+                    "raw_ocr_value": raw_value,
+                    "value_cleared": cleared_value,
+                    "value_recovered": recovered_reading is not None,
+                    "recovered_value": recovered_reading["text"] if recovered_reading else None,
+                    "recovery_confidence": recovered_reading["confidence"] if recovered_reading else None,
+                    "recovery_agreement_count": recovered_reading.get("agreement_count") if recovered_reading else None,
+                    "recovery_bbox": recovered_reading["crop_bbox"] if recovered_reading else None,
+                    "source_bbox": list(row_bbox),
+                    "stamp_bbox": list(stamp_bbox),
+                    "geometry_fallback": "row_and_overlapping_words",
+                    "overlap_ratio": round(row_overlap, 4),
+                }
+                if suspicious_text and prior_cell_issue is not None:
+                    prior_cell_issue.clear()
+                    prior_cell_issue.update(stamp_issue)
+                    if not any(
+                        issue.get("row_index") == row_index
+                        and issue.get("code") == "unexpected_text_in_numeric_lane"
+                        for issue in issues
+                    ):
+                        row_reasons[row_index] = [
+                            reason for reason in row_reasons[row_index]
+                            if reason != "unexpected_text_in_numeric_lane"
+                        ]
+                else:
+                    issues.append(stamp_issue)
+
+            if not matched_columns:
+                issues.append({
+                    "code": "possible_colored_stamp_overlap",
+                    "message": (
+                        "Kemungkinan cap berwarna menimpa baris ini, tetapi kotak sel tidak tersedia dan "
+                        "teks cap tidak dapat dipasangkan dengan satu lane secara aman; periksa seluruh baris."
+                    ),
+                    "row_index": row_index,
+                    "source_bbox": list(row_bbox),
+                    "stamp_bbox": list(stamp_bbox),
+                    "geometry_fallback": "row_only",
+                    "overlap_ratio": round(row_overlap, 4),
+                })
+            break
+
+    if any(issue.get("code") == "possible_colored_stamp_overlap" for issue in issues):
+        table["review_required"] = True
+        table["validation_status"] = "needs_review"
+
+
+def _clear_non_numeric_text_from_ocr_numeric_lanes(table: dict[str, Any]) -> None:
+    """Keep alphabetic-only OCR noise out of statistically numeric scan cells.
+
+    Original OCR text remains attached to a review issue. This does not infer a
+    replacement digit and does not use a header name or fixed column index.
+    """
+    rows = table.get("rows")
+    if not isinstance(rows, list) or len(rows) < 5:
+        return
+    column_count = max(
+        int(table.get("column_count") or 0),
+        max((len(row) for row in rows if isinstance(row, (list, tuple))), default=0),
+    )
+    numeric_columns: set[int] = set()
+    for column_index in range(column_count):
+        values = [
+            _clean_cell(row[column_index])
+            for row in rows
+            if isinstance(row, (list, tuple))
+            and column_index < len(row)
+            and _clean_cell(row[column_index])
+        ]
+        numeric_count = sum(_is_numeric_token(value) for value in values)
+        if len(values) >= 5 and numeric_count >= 4 and numeric_count / len(values) >= 0.70:
+            numeric_columns.add(column_index)
+    if not numeric_columns:
+        return
+
+    row_flags = table.setdefault("rows_need_review", [False] * len(rows))
+    row_reasons = table.setdefault("row_review_reasons", [[] for _ in rows])
+    cell_flags = table.setdefault(
+        "cell_review_flags", [[False] * column_count for _ in rows]
+    )
+    issues = table.setdefault("review_issues", [])
+    cell_boxes = table.get("cell_source_bboxes") or []
+    row_boxes = table.get("row_source_bboxes") or []
+    changed = False
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)):
+            continue
+        for column_index in numeric_columns:
+            if column_index >= len(row):
+                continue
+            raw_value = _clean_cell(row[column_index])
+            if not re.fullmatch(r"[A-Za-zÀ-ž]+", raw_value):
+                continue
+            if any(
+                issue.get("row_index") == row_index
+                and issue.get("column_index") == column_index
+                and issue.get("code") == "possible_colored_stamp_overlap"
+                for issue in issues
+            ):
+                continue
+            if isinstance(row, tuple):
+                row = list(row)
+                rows[row_index] = row
+            row[column_index] = ""
+            row_flags[row_index] = True
+            if "nonnumeric_text_cleared_from_numeric_lane" not in row_reasons[row_index]:
+                row_reasons[row_index].append("nonnumeric_text_cleared_from_numeric_lane")
+            while row_index >= len(cell_flags):
+                cell_flags.append([False] * column_count)
+            while len(cell_flags[row_index]) < column_count:
+                cell_flags[row_index].append(False)
+            cell_flags[row_index][column_index] = True
+            bbox = (
+                cell_boxes[row_index][column_index]
+                if row_index < len(cell_boxes)
+                and column_index < len(cell_boxes[row_index])
+                else row_boxes[row_index] if row_index < len(row_boxes) else None
+            )
+            issues.append({
+                "code": "nonnumeric_text_cleared_from_numeric_lane",
+                "message": (
+                    f"Teks OCR {raw_value!r} bukan angka pada lane yang secara konsisten numerik. "
+                    "Sel dikosongkan tanpa menebak digit; teks mentah tersedia untuk pemeriksaan sumber."
+                ),
+                "row_index": row_index,
+                "column_index": column_index,
+                "raw_ocr_value": raw_value,
+                "value_cleared": True,
+                "source_bbox": list(bbox) if isinstance(bbox, (list, tuple)) else None,
+            })
+            changed = True
+    if changed:
+        table["review_required"] = True
+        table["validation_status"] = "needs_review"
+
+
+def _parse_arithmetic_numeric_cell(value: Any) -> Decimal | None:
+    """Parse an unambiguous OCR number for cross-row consistency checks."""
+    text = _clean_cell(value).replace("−", "-").replace(" ", "")
+    if not text or not re.fullmatch(r"[()+\-]?[\d,.]+[)]?", text):
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    text = text.strip("()")
+    if "," in text and "." not in text:
+        groups = text.lstrip("+-").split(",")
+        if len(groups) > 1 and all(len(group) == 3 for group in groups[1:]):
+            text = text.replace(",", "")
+        else:
+            # A comma can mean either a decimal marker or digit grouping.
+            # Leave that locale-sensitive representation for human review.
+            return None
+    elif "," in text and "." in text:
+        text = text.replace(",", "")
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return None
+    if negative:
+        number = -abs(number)
+    return number if number.is_finite() else None
+
+
+def _format_recovered_decimal(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral_value():
+        return str(normalized.quantize(Decimal("1")))
+    return format(normalized, "f")
+
+
+def _recover_missing_numeric_cells_from_repeated_table_arithmetic(
+    table: dict[str, Any],
+) -> None:
+    """Recover a missing numeric cell only when other rows prove a stable formula.
+
+    This discovers numeric column relationships from the table body rather than
+    relying on column names or fixed layouts. The recovered value remains marked
+    for review and is never created without a matching OCR/geometry warning.
+    """
+    rows = table.get("rows")
+    if not isinstance(rows, list) or len(rows) < 8:
+        return
+    column_count = max(
+        int(table.get("column_count") or 0),
+        max((len(row) for row in rows if isinstance(row, (list, tuple))), default=0),
+    )
+    values = [
+        [
+            _parse_arithmetic_numeric_cell(row[column]) if column < len(row) else None
+            for column in range(column_count)
+        ]
+        for row in rows
+    ]
+    relationships: list[dict[str, Any]] = []
+    for left_column in range(column_count):
+        for right_column in range(left_column + 1, column_count):
+            for product_column in range(column_count):
+                if product_column in {left_column, right_column}:
+                    continue
+                complete = [
+                    row_index for row_index, row_values in enumerate(values)
+                    if row_values[left_column] is not None
+                    and row_values[right_column] is not None
+                    and row_values[product_column] is not None
+                ]
+                if len(complete) < 8:
+                    continue
+                supported = []
+                for row_index in complete:
+                    expected = values[row_index][left_column] * values[row_index][right_column]
+                    actual = values[row_index][product_column]
+                    tolerance = max(Decimal("0.02"), abs(actual) * Decimal("0.0005"))
+                    if abs(expected - actual) <= tolerance:
+                        supported.append(row_index)
+                support_ratio = len(supported) / len(complete)
+                if len(supported) >= 8 and support_ratio >= 0.95:
+                    relationships.append({
+                        "left": left_column,
+                        "right": right_column,
+                        "product": product_column,
+                        "supporting_rows": supported,
+                        "complete_rows": len(complete),
+                        "support_ratio": support_ratio,
+                    })
+    if not relationships:
+        return
+
+    issues = table.setdefault("review_issues", [])
+    row_flags = table.setdefault("rows_need_review", [False] * len(rows))
+    row_reasons = table.setdefault("row_review_reasons", [[] for _ in rows])
+    cell_flags = table.setdefault(
+        "cell_review_flags", [[False] * column_count for _ in rows]
+    )
+    recovered_any = False
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, list):
+            continue
+        for target_column in range(min(column_count, len(row))):
+            if _clean_cell(row[target_column]):
+                continue
+            cell_issues = [
+                issue for issue in issues
+                if issue.get("row_index") == row_index
+                and issue.get("column_index") == target_column
+                and issue.get("code") in {
+                    "possible_colored_stamp_overlap",
+                    "possible_missing_numeric_cell",
+                    "unexpected_text_in_numeric_lane",
+                    "nonnumeric_text_cleared_from_numeric_lane",
+                    "ocr_numeric_confusable_normalized",
+                    "ocr_text_not_assigned_to_cell",
+                }
+            ]
+            if not cell_issues:
+                continue
+            candidates: dict[Decimal, list[dict[str, Any]]] = {}
+            for relationship in relationships:
+                left_column = relationship["left"]
+                right_column = relationship["right"]
+                product_column = relationship["product"]
+                if target_column not in {left_column, right_column, product_column}:
+                    continue
+                if target_column == product_column:
+                    left_value = values[row_index][left_column]
+                    right_value = values[row_index][right_column]
+                    if left_value is None or right_value is None:
+                        continue
+                    recovered = left_value * right_value
+                elif target_column == left_column:
+                    other_value = values[row_index][right_column]
+                    product_value = values[row_index][product_column]
+                    if other_value in {None, Decimal(0)} or product_value is None:
+                        continue
+                    recovered = product_value / other_value
+                else:
+                    other_value = values[row_index][left_column]
+                    product_value = values[row_index][product_column]
+                    if other_value in {None, Decimal(0)} or product_value is None:
+                        continue
+                    recovered = product_value / other_value
+                candidates.setdefault(recovered, []).append(relationship)
+            if len(candidates) != 1:
+                continue
+            recovered_value, evidence = next(iter(candidates.items()))
+            # Zero-valued amount cells are often represented by a dash or a
+            # blank in the source. Arithmetic alone cannot distinguish those
+            # conventions, so preserve the missing cell for manual review.
+            if recovered_value == 0:
+                continue
+            # The formula must independently predict the same target from at
+            # least one pair of observed inputs in this row.
+            relationship = max(
+                evidence,
+                key=lambda item: (item["support_ratio"], len(item["supporting_rows"])),
+            )
+            recovered_text = _format_recovered_decimal(recovered_value)
+            row[target_column] = recovered_text
+            values[row_index][target_column] = recovered_value
+            while len(row_flags) <= row_index:
+                row_flags.append(False)
+            while len(row_reasons) <= row_index:
+                row_reasons.append([])
+            while len(cell_flags) <= row_index:
+                cell_flags.append([False] * column_count)
+            while len(cell_flags[row_index]) < column_count:
+                cell_flags[row_index].append(False)
+            row_flags[row_index] = True
+            cell_flags[row_index][target_column] = True
+            reason = "numeric_value_recovered_from_repeated_table_relation"
+            if reason not in row_reasons[row_index]:
+                row_reasons[row_index].append(reason)
+
+            stale_numeric_issues = [
+                issue for issue in cell_issues
+                if issue.get("code") != "possible_colored_stamp_overlap"
+            ]
+            issue = next(
+                (item for item in cell_issues if item.get("code") == "possible_colored_stamp_overlap"),
+                cell_issues[0],
+            )
+            issue.update({
+                "message": (
+                    f"Nilai kosong dipulihkan sebagai '{recovered_text}' dari relasi numerik "
+                    f"yang berulang pada {len(relationship['supporting_rows'])}/"
+                    f"{relationship['complete_rows']} baris pembanding. Nilai tetap perlu "
+                    "dicocokkan dengan PDF sumber."
+                ),
+                "value_recovered": True,
+                "recovered_value": recovered_text,
+                "value_cleared": False,
+                "recovery_method": "repeated_table_arithmetic",
+                "recovery_columns": [
+                    relationship["left"], relationship["right"], relationship["product"],
+                ],
+                "supporting_rows": len(relationship["supporting_rows"]),
+                "complete_rows": relationship["complete_rows"],
+                "support_ratio": round(relationship["support_ratio"], 4),
+            })
+            if issue.get("code") != "possible_colored_stamp_overlap":
+                issue["code"] = "numeric_value_recovered_from_repeated_table_relation"
+            issues[:] = [item for item in issues if item not in stale_numeric_issues]
+            if not any(
+                item.get("row_index") == row_index
+                and item.get("code") == "unexpected_text_in_numeric_lane"
+                for item in issues
+            ):
+                row_reasons[row_index] = [
+                    reason for reason in row_reasons[row_index]
+                    if reason != "unexpected_text_in_numeric_lane"
+                ]
+            recovered_any = True
+
+    if recovered_any:
+        table["review_required"] = True
+        table["validation_status"] = "needs_review"
+
+
+def _bbox_union(boxes: list[Any]) -> list[float] | None:
+    valid: list[tuple[float, float, float, float]] = []
+    for box in boxes:
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            values = tuple(float(value) for value in box)
+        except (TypeError, ValueError):
+            continue
+        if values[2] > values[0] and values[3] > values[1]:
+            valid.append(values)
+    if not valid:
+        return None
+    return [
+        round(min(box[0] for box in valid), 2),
+        round(min(box[1] for box in valid), 2),
+        round(max(box[2] for box in valid), 2),
+        round(max(box[3] for box in valid), 2),
+    ]
+
+
+def _merge_adjacent_header_fragments(
+    headers: list[str],
+    primary_words_by_column: list[list[dict[str, Any]]],
+    primary_line: dict[str, Any],
+    lines: list[dict[str, Any]],
+    lane_boundaries: list[float],
+    page_width: float,
+) -> tuple[list[str], list[list[list[float]]]]:
+    """Attach short, x-aligned header fragments from neighboring baselines."""
+    merged = list(headers)
+    attached_boxes: list[list[list[float]]] = [[] for _ in headers]
+    primary_spans = [
+        (
+            min(float(word["x0"]) for word in words),
+            max(float(word["x1"]) for word in words),
+        ) if words else None
+        for words in primary_words_by_column
+    ]
+    primary_y = float(primary_line["y"])
+    for line in sorted(lines, key=lambda item: float(item["y"])):
+        delta = float(line["y"]) - primary_y
+        if delta == 0 or delta < -14.0 or delta > 15.0 or abs(delta) < 2.5:
+            continue
+        if _is_repeated_identifier_data_line(line, lines, page_width):
+            continue
+        for run in line.get("runs", []):
+            words = list(run.get("words", [])) or [run]
+            for word in words:
+                text = _clean_cell(word.get("text", "")).strip(" _-:()")
+                if not text or len(text) > 24 or not re.search(r"[A-Za-zÀ-ž]", text):
+                    continue
+                if _is_numeric_token(text):
+                    continue
+                center = (float(word["x0"]) + float(word["x1"])) / 2.0
+                column = bisect_right(lane_boundaries, center)
+                if column >= len(merged) or not merged[column] or not primary_spans[column]:
+                    continue
+                primary_x0, primary_x1 = primary_spans[column]
+                fragment_x0, fragment_x1 = float(word["x0"]), float(word["x1"])
+                overlap = max(0.0, min(primary_x1, fragment_x1) - max(primary_x0, fragment_x0))
+                smaller_width = min(primary_x1 - primary_x0, fragment_x1 - fragment_x0)
+                if smaller_width <= 0 or overlap / smaller_width < 0.35:
+                    continue
+                if re.search(rf"(?<!\w){re.escape(text)}(?!\w)", merged[column], re.IGNORECASE):
+                    continue
+                merged[column] = (
+                    f"{text} {merged[column]}" if delta < 0
+                    else f"{merged[column]} ({text})"
+                )
+                attached_boxes[column].append([
+                    round(float(word["x0"]), 2),
+                    round(float(word["y0"]), 2),
+                    round(float(word["x1"]), 2),
+                    round(float(word["y1"]), 2),
+                ])
+    return merged, attached_boxes
 
 
 def _extract_repeated_identifier_table(
@@ -3285,6 +5425,8 @@ def _extract_repeated_identifier_table(
     header_line = max(prior_lines, key=lambda item: float(item["y"])) if prior_lines else None
     headers = [""] * len(lane_starts)
     header_bbox: list[float] | None = None
+    header_words_by_column: list[list[dict[str, Any]]] = [[] for _ in lane_starts]
+    stacked_header_boxes_by_column: list[list[list[float]]] = [[] for _ in lane_starts]
     if header_line:
         bins: list[list[str]] = [[] for _ in lane_starts]
         header_words: list[dict[str, Any]] = []
@@ -3298,18 +5440,39 @@ def _extract_repeated_identifier_table(
             text = _clean_cell(word.get("text", ""))
             if not text or _is_numeric_token(text):
                 continue
-            x = float(word.get("x0", 0)) - x_slope * (
+            # Header labels are often centered within their cells. Using the
+            # left edge can place a wide label into the preceding lane when it
+            # straddles the geometric midpoint (for example, Amount near the
+            # Price/Amount boundary). The word center is a better source anchor.
+            x = (float(word.get("x0", 0)) + float(word.get("x1", 0))) / 2.0 - x_slope * (
                 float(header_line["y"]) - reference_y
             )
             column = bisect_right(lane_boundaries, x)
             bins[column].append(text)
+            header_words_by_column[column].append(word)
         headers = [re.sub(r"\s+", " ", " ".join(items)).strip(" _-:|") for items in bins]
+        headers, stacked_header_boxes_by_column = _merge_adjacent_header_fragments(
+            headers,
+            header_words_by_column,
+            header_line,
+            lines,
+            lane_boundaries,
+            page_width,
+        )
         header_bbox = [
             round(min(float(word.get("x0", 0)) for word in header_words), 2),
             round(min(float(word.get("y0", header_line["y"])) for word in header_words), 2),
             round(max(float(word.get("x1", 0)) for word in header_words), 2),
             round(max(float(word.get("y1", header_line["y"])) for word in header_words), 2),
         ] if header_words else None
+        fragment_boxes = [box for column_boxes in stacked_header_boxes_by_column for box in column_boxes]
+        if header_bbox and fragment_boxes:
+            header_bbox = [
+                round(min(header_bbox[0], *(box[0] for box in fragment_boxes)), 2),
+                round(min(header_bbox[1], *(box[1] for box in fragment_boxes)), 2),
+                round(max(header_bbox[2], *(box[2] for box in fragment_boxes)), 2),
+                round(max(header_bbox[3], *(box[3] for box in fragment_boxes)), 2),
+            ]
 
     if not any(headers):
         # Do not invent a fixed schema when the scan has no readable header.
@@ -3371,7 +5534,21 @@ def _extract_repeated_identifier_table(
         "headers": headers,
         "header_rows": [headers] if any(headers) else [],
         "header_cells": [
-            {"row": 0, "column": index, "text": label, "rowspan": 1, "colspan": 1, "source_bbox": None}
+            {
+                "row": 0,
+                "column": index,
+                "text": label,
+                "rowspan": 1,
+                "colspan": 1,
+                "source_bbox": _bbox_union([
+                    [
+                        min(float(word["x0"]) for word in words),
+                        min(float(word["y0"]) for word in words),
+                        max(float(word["x1"]) for word in words),
+                        max(float(word["y1"]) for word in words),
+                    ] for words in [header_words_by_column[index]] if words
+                ] + stacked_header_boxes_by_column[index]),
+            }
             for index, label in enumerate(headers) if label
         ],
         "header_detected": bool(any(headers)),
@@ -5012,24 +7189,74 @@ def extract_tables_from_page(
     source_tables, data_bottom = _extract_from_native_candidates(line_candidates)
 
     visual_lines = _word_runs_on_visual_baselines(page)
+    if getattr(page, "ocr_word_count", 0):
+        visual_lines = _without_browser_print_footer_lines(
+            visual_lines, float(page.rect.height)
+        )
     positioned_summary_candidates: list[dict[str, Any]] | None = None
-    line_tables_have_headers = any(table.get("header_detected") for table in source_tables)
-    if not source_tables or not line_tables_have_headers:
+    line_item_tables = [
+        table for table in source_tables
+        if table.get("table_role") != "document_header"
+    ]
+    line_tables_have_headers = any(table.get("header_detected") for table in line_item_tables)
+    largest_native_candidate = max(
+        (int(table.get("row_count") or 0) for table in line_item_tables),
+        default=0,
+    )
+    native_candidate_has_repeated_item_ids = any(
+        sum(
+            bool(row)
+            and _is_item_identifier(_clean_cell(row[0]))
+            and sum(bool(_clean_cell(value)) for value in row) >= 2
+            for row in table.get("rows", [])
+            if isinstance(row, (list, tuple))
+        ) >= 2
+        for table in line_item_tables
+    )
+    # A small native candidate can be a key/value block above a borderless item
+    # table. Its label row may look like a table header, so also consult the
+    # page's positioned row geometry before allowing it to suppress recovery.
+    # Do not run this extra check when PyMuPDF has already split a source grid
+    # into multiple row fragments; the existing headerless recovery handles
+    # those pages and avoids duplicating their native fragments.
+    native_candidate_is_small = (
+        not getattr(page, "ocr_word_count", 0)
+        and len(line_item_tables) == 1
+        and largest_native_candidate < 3
+        and not native_candidate_has_repeated_item_ids
+    )
+    if not source_tables or not line_tables_have_headers or native_candidate_is_small:
         positioned_summary_candidates = _find_summary_candidates(page, visual_lines)
         geometry_table, geometry_bottom = _extract_geometry_table(
             page, visual_lines, positioned_summary_candidates,
         )
         if geometry_table:
-            largest_native_candidate = max(
-                (int(table.get("row_count") or 0) for table in source_tables),
-                default=0,
-            )
             geometry_is_stronger = (
                 bool(geometry_table.get("header_detected"))
                 and int(geometry_table.get("row_count") or 0) > largest_native_candidate
             )
-            if not source_tables or (not line_tables_have_headers and geometry_is_stronger):
-                source_tables = [geometry_table]
+            if not source_tables:
+                source_tables.append(geometry_table)
+                data_bottom = geometry_bottom
+            elif geometry_is_stronger:
+                if not line_tables_have_headers:
+                    # Preserve the established behavior for headerless pages:
+                    # a stronger geometry reconstruction replaces weak native
+                    # fragments instead of appearing as an additional table.
+                    source_tables = [geometry_table]
+                else:
+                    target_indexes = [
+                        index for index, table in enumerate(source_tables)
+                        if table.get("table_role") != "document_header"
+                    ]
+                    if target_indexes:
+                        target_index = max(
+                            target_indexes,
+                            key=lambda index: int(source_tables[index].get("row_count") or 0),
+                        )
+                        source_tables[target_index] = geometry_table
+                    else:
+                        source_tables.append(geometry_table)
                 data_bottom = geometry_bottom
             if "geometry_header_anchored" not in methods_attempted:
                 methods_attempted.append("geometry_header_anchored")
@@ -5390,6 +7617,10 @@ def extract_tables_from_page(
         if positioned_summary_candidates is not None and source_tables
         else _find_summary_candidates(page, visual_lines) if source_tables else []
     )
+    if getattr(page, "ocr_word_count", 0) and raw_summaries:
+        data_bottom = _detach_ocr_summary_candidates_from_item_rows(
+            page, source_tables, raw_summaries, data_bottom,
+        )
     summary_items = _public_summary_items(raw_summaries, data_bottom)
     metadata_items = _extract_document_metadata(page, source_tables, raw_summaries, visual_lines)
 
@@ -5407,8 +7638,13 @@ def extract_tables_from_page(
             table.setdefault("layout_type", "item_table")
         if getattr(page, "ocr_word_count", 0):
             _annotate_ocr_table_review(page, table)
+            _recover_missing_ocr_text_line_from_geometry(page, table)
             _normalize_confusable_numeric_ocr_cells(page, table)
+            _annotate_colored_stamp_overlaps(page, table)
+            _clear_non_numeric_text_from_ocr_numeric_lanes(table)
+            _recover_missing_numeric_cells_from_repeated_table_arithmetic(table)
             _attach_parent_item_context(page, table, visual_lines)
+            _attach_ocr_cell_evidence(page, table)
         else:
             _attach_pre_row_context(page, table, visual_lines)
     if timing_metrics is not None:

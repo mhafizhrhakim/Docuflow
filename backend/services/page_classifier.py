@@ -15,6 +15,8 @@ from typing import Final
 
 
 SCAN_IMAGE_COVERAGE_THRESHOLD: Final[float] = 0.80
+SCAN_TEXT_IMAGE_OVERLAP_THRESHOLD: Final[float] = 0.70
+MIN_SCAN_IMAGE_COVERAGE_WITH_TEXT_LAYER: Final[float] = 0.25
 
 
 def _normalise_image_coverage(
@@ -64,6 +66,7 @@ def classify_page_source(
     has_extractable_text: bool,
     image_count: int | None = None,
     image_coverage: float | None = None,
+    text_image_overlap: float | None = None,
 ) -> str:
     """Classify a page without automatically trusting a hidden text layer.
 
@@ -74,6 +77,9 @@ def classify_page_source(
             Number of embedded images reported by PyMuPDF.
         image_coverage:
             Fraction of page area covered by images, from 0.0 to 1.0.
+        text_image_overlap:
+            Fraction of native text word centers located over embedded image
+            regions. This helps identify scanned pages with hidden text layers.
 
     Returns:
         One of the stable classification labels consumed by document_parser.py.
@@ -81,6 +87,7 @@ def classify_page_source(
     has_text = bool(has_extractable_text)
     count = _normalise_image_count(image_count)
     coverage = _normalise_image_coverage(image_coverage)
+    overlap = _normalise_image_coverage(text_image_overlap)
 
     # A full-page image may contain an inaccurate hidden OCR text layer.
     # Route it through OCR even when native text is present.
@@ -91,6 +98,21 @@ def classify_page_source(
         if has_text:
             return "scan_with_text_layer"
         return "scan_candidate"
+
+    # Scanned PDFs sometimes contain a hidden OCR text layer over an image that
+    # does not cover the entire page (for example, a cropped scan with margins).
+    # When most native words lie over a substantial image region, treat that
+    # text as potentially unreliable and route the page through the OCR path.
+    if (
+        has_text
+        and count is not None
+        and count > 0
+        and coverage is not None
+        and coverage >= MIN_SCAN_IMAGE_COVERAGE_WITH_TEXT_LAYER
+        and overlap is not None
+        and overlap >= SCAN_TEXT_IMAGE_OVERLAP_THRESHOLD
+    ):
+        return "scan_with_text_layer"
 
     # Preserve the fallback behavior when image count is unavailable.
     if count is None:

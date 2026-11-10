@@ -41,6 +41,13 @@ button:disabled { opacity: .47; cursor: not-allowed !important; }
 .button-primary { background: var(--accent); border-color: var(--accent); color: #fff; box-shadow: 0 3px 8px #1264f51c; }
 .button-primary:hover:not(:disabled) { background: #0756de; border-color: #0756de; }
 .button-small { min-height: 34px; padding: 0 10px; font-size: 10px; }
+.table-export-menu { position: relative; display: inline-flex; }
+.table-export-menu > summary { list-style: none; }
+.table-export-menu > summary::-webkit-details-marker { display: none; }
+.table-export-menu[open] > summary { border-color: #afc9f4; background: #f4f8ff; }
+.table-export-menu-options { position: absolute; z-index: 30; top: calc(100% + 5px); right: 0; min-width: 138px; display: grid; gap: 5px; padding: 6px; border: 1px solid var(--line); border-radius: 9px; background: #fff; box-shadow: 0 8px 24px #17346520; }
+.table-export-menu-options .button { width: 100%; justify-content: flex-start; }
+.table-export-menu-bottom .table-export-menu-options { top: auto; bottom: calc(100% + 5px); }
 .main-content { width: 100%; padding: 10px 20px 22px; margin: 0 auto; max-width: 2100px; }
 .panel { min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 1px 2px #17346505; overflow: hidden; }
 .page-classification { display: grid; grid-template-columns: auto minmax(120px,1fr) auto; gap: 16px; align-items: center; padding: 10px 14px; margin-bottom: 10px; }
@@ -298,6 +305,11 @@ button:disabled { opacity: .47; cursor: not-allowed !important; }
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+.multi-progress-elapsed {
+  color: #657691;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .multi-progress-bar,
 #multi-overall-progress-bar {
   width: 100%;
@@ -364,11 +376,14 @@ button:disabled { opacity: .47; cursor: not-allowed !important; }
 .multi-overall-progress[hidden],
 #multi-overall-progress-bar[hidden] { display: none; }
 .multi-overall-progress-copy strong {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 700;
 }
+.multi-overall-progress-copy .multi-progress-elapsed { flex: 0 0 auto; }
 .multi-pdf-viewer-container {
   height: clamp(230px, 25vw, 330px);
   min-height: 220px;

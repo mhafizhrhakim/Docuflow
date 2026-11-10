@@ -1,0 +1,54 @@
+name: docuflow
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    environment:
+      APP_NAME: DocuFlow
+      APP_ENV: production
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      FRONTEND_ORIGIN: ${DOCUFLOW_FRONTEND_ORIGIN:-http://localhost:8080}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      UPLOAD_TTL_MINUTES: ${UPLOAD_TTL_MINUTES:-30}
+      INSPECTION_WORKERS: ${INSPECTION_WORKERS:-2}
+      INSPECTION_QUEUE_SLOTS: ${INSPECTION_QUEUE_SLOTS:-2}
+      OCR_INTRA_OP_THREADS: ${OCR_INTRA_OP_THREADS:-2}
+      TMPDIR: /tmp
+    expose:
+      - "8000"
+    volumes:
+      - docuflow-ocr-cache:/app/backend/storage/work/ocr-cache
+      - rapidocr-models:/usr/local/lib/python3.11/site-packages/rapidocr/models
+      - rapidtable-models:/usr/local/lib/python3.11/site-packages/rapid_table/models
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 5
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: frontend
+    ports:
+      - "${DOCUFLOW_BIND_ADDRESS:-127.0.0.1}:${DOCUFLOW_HTTP_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  docuflow-ocr-cache:
+  rapidocr-models:
+  rapidtable-models:

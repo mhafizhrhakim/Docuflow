@@ -13,6 +13,28 @@ import httpx
 from backend.services import document_parser, ocr_adapter
 
 
+def test_raw_ocr_result_retains_punctuation_decimals_long_text_and_confidence():
+    result = SimpleNamespace(word_results=[[
+        ("O-ring", 0.96, [[0, 0], [30, 0], [30, 10], [0, 10]]),
+        (" / ", 0.82, [[32, 0], [36, 0], [36, 10], [32, 10]]),
+        ("type-B", 0.94, [[38, 0], [64, 0], [64, 10], [38, 10]]),
+        ("0.75", 0.99, [[66, 0], [84, 0], [84, 10], [66, 10]]),
+        ("DIN-912, M8/1.25; stainless-steel replacement assembly", 0.91,
+         [[86, 0], [220, 0], [220, 10], [86, 10]]),
+    ]])
+
+    entries = ocr_adapter._entries_from_result(result)
+
+    assert [entry["text"] for entry in entries] == [
+        "O-ring", "/", "type-B", "0.75",
+        "DIN-912, M8/1.25; stainless-steel replacement assembly",
+    ]
+    assert [entry["confidence"] for entry in entries] == [0.96, 0.82, 0.94, 0.99, 0.91]
+    assert entries[1]["points"] == [(32.0, 0.0), (36.0, 0.0), (36.0, 10.0), (32.0, 10.0)]
+    assert entries[1]["text"] == "/"
+    assert entries[1]["raw_text"] == " / "
+
+
 def _sample_pdf() -> bytes:
     """Page 1: digital text. Page 2: full-page image without text (a scan)."""
     doc = pymupdf.open()
@@ -25,6 +47,24 @@ def _sample_pdf() -> bytes:
     data = doc.tobytes()
     doc.close()
     return data
+
+
+def _mixed_pdf_with_raster_text() -> bytes:
+    """Create a mixed PDF whose second page has visible text only as pixels."""
+    source = pymupdf.open()
+    source_page = source.new_page(width=300, height=420)
+    source_page.insert_text((30, 70), "SCANNED ITEM 5 EA", fontsize=24)
+    raster = source_page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+
+    document = pymupdf.open()
+    digital = document.new_page(width=300, height=420)
+    digital.insert_text((30, 70), "NATIVE DIGITAL PAGE")
+    scan = document.new_page(width=300, height=420)
+    scan.insert_image(scan.rect, pixmap=raster)
+    result = document.tobytes()
+    source.close()
+    document.close()
+    return result
 
 
 def test_run_ocr_false_returns_pending_without_running_ocr(monkeypatch):
@@ -344,6 +384,7 @@ def test_ocr_raw_cache_skips_render_and_inference_for_same_pdf_page(monkeypatch,
     assert second.ocr_cache_hit is True
     assert second.render_elapsed_seconds == 0
     assert second.get_text("text") == "cached word"
+    assert first.items[0]["raw_text"] == second.items[0]["raw_text"] == "cached word"
 
 
 def test_ocr_cache_key_separates_pages_and_dpi(monkeypatch, tmp_path):
@@ -382,6 +423,23 @@ def test_endpoint_ocr_flag_and_health(live_http_server):
     health = httpx.get(f"{live_http_server}/api/health", timeout=5).json()
     assert health["status"] == "ok"
     assert "dependencies_installed" in health["ocr"]
+
+
+def test_endpoint_ocr_upload_processes_mixed_pdf_without_application_login(live_http_server):
+    response = httpx.post(
+        f"{live_http_server}/api/documents/inspect?ocr=true",
+        files={"file": ("mixed-smoke.pdf", _mixed_pdf_with_raster_text(), "application/pdf")},
+        timeout=90,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ocr_requested"] is True
+    assert body["page_count"] == 2
+    assert body["pages"][0]["has_extractable_text"] is True
+    assert body["pages"][1]["source_candidate"] == "scan_candidate"
+    assert body["pages"][1]["ocr_applied"] is True
+    assert body["pages"][1]["ocr_word_count"] > 0
 
 
 def test_endpoint_reports_page_progress_without_document_content(live_http_server):

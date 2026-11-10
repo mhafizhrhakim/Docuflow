@@ -2,10 +2,12 @@ import { createPdfViewer } from "./pdf-viewer.js";
 import { inspectPdfDocument } from "./api.js";
 import { pageHasNativeText } from "./page-classification.mjs";
 import { runBounded } from "./concurrency.js";
-import { aggregatePageProgress, calculatePageProgress } from "./progress.js";
+import { aggregatePageProgress, calculatePageProgress, getProgressPercentage } from "./progress.js";
+import { createElapsedTimer } from "./elapsed-timer.js";
 import {
   copyTablesToClipboard,
   downloadTablesAsCsv,
+  downloadTablesAsXlsx,
   renderDetectedTables,
   showExtractionPending,
 } from "./extraction-table.js";
@@ -68,14 +70,17 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
   const progressSpinner = createElement("span", "multi-progress-spinner");
   progressSpinner.setAttribute("aria-hidden", "true");
   const progressPhase = createElement("strong", "multi-progress-phase", "Menunggu");
+  const progressElapsed = createElement("span", "multi-progress-elapsed", "Durasi 00:00");
+  progressElapsed.setAttribute("aria-live", "off");
   const progressPercent = createElement("span", "multi-progress-percent", "—");
-  progressCopy.append(progressSpinner, progressPhase, progressPercent);
+  progressCopy.append(progressSpinner, progressPhase, progressElapsed, progressPercent);
   const progressBar = document.createElement("progress");
   progressBar.className = "multi-progress-bar";
   progressBar.max = 100;
   progressBar.value = 0;
   progressBar.setAttribute("aria-label", `Progres ekstraksi ${file.name}`);
   progressPanel.append(progressCopy, progressBar);
+  const extractionTimer = createElapsedTimer(progressElapsed);
 
   const viewerContainer = createElement("div", "multi-pdf-viewer-container");
   const empty = createElement("div", "empty-preview multi-card-empty");
@@ -105,10 +110,18 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
   searchInput.disabled = true;
   searchLabel.append(searchIcon, searchInput);
   const copyButton = makeButton("Salin halaman", "", `Salin tabel halaman aktif dari ${file.name}`);
-  const csvButton = makeButton("Unduh CSV", "", `Unduh tabel halaman aktif dari ${file.name} sebagai CSV`);
+  const exportMenu = createElement("details", "table-export-menu");
+  const exportMenuSummary = createElement("summary", "button button-small", "⇩ Ekspor");
+  exportMenuSummary.title = "Pilih format unduhan";
+  const exportMenuOptions = createElement("div", "table-export-menu-options");
+  const csvButton = makeButton("CSV", "button button-small", `Unduh tabel halaman aktif dari ${file.name} sebagai CSV`);
+  const xlsxButton = makeButton("Excel (.xlsx)", "button button-small", `Unduh tabel halaman aktif dari ${file.name} sebagai Excel bergaris`);
+  exportMenuOptions.append(csvButton, xlsxButton);
+  exportMenu.append(exportMenuSummary, exportMenuOptions);
   copyButton.disabled = true;
   csvButton.disabled = true;
-  extractionActions.append(searchLabel, copyButton, csvButton);
+  xlsxButton.disabled = true;
+  extractionActions.append(searchLabel, copyButton, exportMenu);
   const tableWrap = createElement("div", "data-table-wrap multi-data-table-wrap");
   const footer = createElement("div", "table-footnote", `Sumber: ${file.name} · halaman 1`);
   extractionSection.append(extractionHeader, extractionActions, tableWrap, footer);
@@ -157,10 +170,7 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
     };
     const pageProgress = calculatePageProgress(progressSnapshot.completed_pages, progressSnapshot.total_pages);
     const total = pageProgress.total_pages;
-    const reportedPercentage = Number(progressSnapshot.progress_percent);
-    const percentage = Number.isFinite(reportedPercentage)
-      ? Math.max(0, Math.min(100, Math.floor(reportedPercentage)))
-      : pageProgress.percentage ?? 0;
+    const percentage = getProgressPercentage(progressSnapshot);
     progressBar.value = percentage;
     progressPercent.textContent = total > 0 ? `${percentage}%` : "—";
     progressPanel.classList.toggle("is-active", progressSnapshot.status === "processing");
@@ -204,6 +214,7 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
     if (!inspectionResult || !page) {
       copyButton.disabled = true;
       csvButton.disabled = true;
+      xlsxButton.disabled = true;
       searchInput.disabled = true;
       showExtractionPending({
         container: tableWrap,
@@ -234,6 +245,7 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
     });
     copyButton.disabled = !hasTables(page);
     csvButton.disabled = !hasTables(page);
+    xlsxButton.disabled = !hasTables(page);
     searchInput.disabled = !hasTables(page);
     fileMeta.textContent = `${formatBytes(file.size)} · ${resultPages.length} halaman · ${inspectionResult.ocr_status ?? "selesai"}`;
   };
@@ -249,6 +261,7 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
     }
   });
   csvButton.addEventListener("click", () => {
+    exportMenu.open = false;
     const page = getPageResult();
     if (!hasTables(page)) return;
     try {
@@ -256,11 +269,29 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
         tables: page.tables,
         sourceName: file.name,
         pageNumber: currentPage,
+        includeSourceColumns: false,
         filename: `${file.name.replace(/\.pdf$/i, "")}-halaman-${currentPage}.csv`,
       });
       status.textContent = `CSV halaman ${currentPage} diunduh.`;
     } catch (error) {
       status.textContent = error?.message || "CSV gagal dibuat.";
+    }
+  });
+  xlsxButton.addEventListener("click", () => {
+    exportMenu.open = false;
+    const page = getPageResult();
+    if (!hasTables(page)) return;
+    try {
+      downloadTablesAsXlsx({
+        tables: page.tables,
+        sourceName: file.name,
+        pageNumber: currentPage,
+        includeSourceColumns: false,
+        filename: `${file.name.replace(/\.pdf$/i, "")}-halaman-${currentPage}.xlsx`,
+      });
+      status.textContent = `Excel halaman ${currentPage} diunduh.`;
+    } catch (error) {
+      status.textContent = error?.message || "Workbook Excel gagal dibuat.";
     }
   });
   const pageLabelProxy = {
@@ -324,6 +355,8 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
 
   async function processDocument({ isCurrent = () => true } = {}) {
     if (!previewLoaded || !isCurrent()) return;
+    extractionTimer.reset();
+    extractionTimer.start();
     updateProgress({ phase: "reading_pdf", status: "processing" });
     setCardState("processing", `Membaca PDF · ${file.name}`);
     renderCurrentPage();
@@ -341,6 +374,7 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
       const reviewPages = pages.filter((page) => (page.tables ?? []).some((table) => table.review_required));
       const scanned = pages.filter((page) => page.ocr_applied).length;
       const resultFailed = failedPages.length > 0;
+      extractionTimer.stop();
       updateProgress({
         phase: resultFailed ? "failed" : "completed",
         status: resultFailed ? "partial_failure" : "completed",
@@ -360,9 +394,11 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
       renderCurrentPage();
     } catch (error) {
       if (!isCurrent()) return;
+      extractionTimer.stop();
       updateProgress({ phase: "failed", status: "failed" });
       copyButton.disabled = true;
       csvButton.disabled = true;
+      xlsxButton.disabled = true;
       searchInput.disabled = true;
       extractionSubtitle.textContent = `Halaman ${currentPage} · ekstraksi gagal`;
       tableWrap.replaceChildren(createElement(
@@ -382,6 +418,7 @@ function createDocumentCard(file, index, { onState = () => {} } = {}) {
     processDocument,
     clear: async () => {
       abortController?.abort();
+      extractionTimer.stop();
       await viewer.clear();
     },
     file,
@@ -396,13 +433,16 @@ export function createMultiDocumentWorkflow({
   emptyState,
   statusElement,
   combinedExportButton,
+  combinedXlsxExportButton,
   overallProgressContainer,
   overallProgressBar,
   overallProgressLabel,
+  overallElapsedLabel,
   onDocumentInfo = () => {},
 } = {}) {
   let cards = [];
   let selectionToken = 0;
+  const overallElapsedTimer = createElapsedTimer(overallElapsedLabel);
 
   function refreshOverallProgress() {
     if (!cards.length) {
@@ -425,6 +465,8 @@ export function createMultiDocumentWorkflow({
     const countsKnown = aggregate.counts_known;
     const failedDocuments = cards.filter((card) => card.getState() === "failed").length;
     const finishedDocuments = cards.filter((card) => ["completed", "needs_review", "failed"].includes(card.getState())).length;
+    const terminal = finishedDocuments === cards.length;
+    if (terminal) overallElapsedTimer.stop();
     if (!countsKnown) {
       if (overallProgressBar) overallProgressBar.hidden = true;
       if (overallProgressLabel) {
@@ -441,7 +483,6 @@ export function createMultiDocumentWorkflow({
       overallProgressBar.hidden = false;
       overallProgressBar.value = percentage;
     }
-    const terminal = finishedDocuments === cards.length;
     const active = cards.some((card) => card.getState() === "processing");
     const stage = snapshots.find((progress) => progress.status === "processing")?.phase;
     const stageLabel = stage === "validating_tables" ? "Memvalidasi tabel"
@@ -478,9 +519,10 @@ export function createMultiDocumentWorkflow({
       (page.tables ?? []).some((table) => table?.is_source_table !== false && table?.rows?.length)
     ));
     if (combinedExportButton) combinedExportButton.disabled = !ready;
+    if (combinedXlsxExportButton) combinedXlsxExportButton.disabled = !ready;
   }
 
-  combinedExportButton?.addEventListener("click", () => {
+  function getCombinedTables() {
     const tables = [];
     cards.forEach((card) => {
       const result = card.getResult();
@@ -501,6 +543,12 @@ export function createMultiDocumentWorkflow({
         });
       });
     });
+    return tables;
+  }
+
+  combinedExportButton?.addEventListener("click", () => {
+    combinedExportButton.closest("details")?.removeAttribute("open");
+    const tables = getCombinedTables();
     if (!tables.length) return;
     try {
       downloadTablesAsCsv({
@@ -519,7 +567,27 @@ export function createMultiDocumentWorkflow({
     }
   });
 
+  combinedXlsxExportButton?.addEventListener("click", () => {
+    combinedXlsxExportButton.closest("details")?.removeAttribute("open");
+    const tables = getCombinedTables();
+    if (!tables.length) return;
+    try {
+      downloadTablesAsXlsx({
+        tables,
+        sourceName: "multi-document",
+        filename: "docuflow-hasil-gabungan.xlsx",
+        extraColumns: ["Jenis dokumen", "Jenis halaman", "Status ekstraksi"],
+        extraValues: (table) => ["Belum diklasifikasikan", table.export_page_type, table.export_document_status],
+      });
+      statusElement.textContent = "Workbook Excel gabungan seluruh hasil yang tersedia diunduh.";
+    } catch (error) {
+      statusElement.textContent = error?.message || "Workbook Excel gabungan gagal dibuat.";
+    }
+  });
+
   async function disposeCards() {
+    overallElapsedTimer.stop();
+    overallElapsedTimer.reset();
     const oldCards = cards;
     cards = [];
     await Promise.all(oldCards.map((card) => card.clear().catch(() => {})));
@@ -564,6 +632,7 @@ export function createMultiDocumentWorkflow({
     cards = pdfs.map((file, index) => createDocumentCard(file, index, {
       onState: () => refreshWorkflowStatus(),
     }));
+    overallElapsedTimer.start();
     refreshWorkflowStatus();
     const fragment = document.createDocumentFragment();
     cards.forEach((card) => fragment.append(card.element));

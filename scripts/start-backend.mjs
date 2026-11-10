@@ -92,17 +92,22 @@ if (!selected) {
 }
 
 console.log(`Starting DocuFlow backend with ${selected.command} (${selected.environment.label}).`);
-const appHost = process.env.APP_HOST || "127.0.0.1";
-const appPort = process.env.APP_PORT || "8000";
+const appPort = process.env.PORT || process.env.APP_PORT || "8000";
 const appEnv = (process.env.APP_ENV || "development").toLowerCase();
+const productionRuntime = appEnv === "production" || process.env.RENDER?.toLowerCase() === "true";
 const uvicornArgs = ["-m", "uvicorn", "backend.main:app"];
 // Uvicorn's reload and worker modes spawn child processes on Windows. Run a
 // single process there because socket handoff to those children is unreliable
 // in the local Windows runtime. Linux keeps the existing behavior.
-if (!windows && appEnv === "development") uvicornArgs.push("--reload");
+if (!windows && !productionRuntime) uvicornArgs.push("--reload");
 // Progress and OCR caches are process-local. Keep one worker until these are
 // moved to shared storage; threads inside the app already bound PDF jobs.
 else if (!windows) uvicornArgs.push("--workers", "1");
+const defaultHost = productionRuntime ? "0.0.0.0" : "127.0.0.1";
+const configuredHost = process.env.APP_HOST?.trim();
+const appHost = productionRuntime && ["127.0.0.1", "localhost"].includes(configuredHost?.toLowerCase())
+  ? "0.0.0.0"
+  : configuredHost || defaultHost;
 uvicornArgs.push("--host", appHost, "--port", appPort);
 const backend = spawn(
   selected.command,

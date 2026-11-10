@@ -2,6 +2,8 @@
 from pathlib import Path
 import hashlib
 import json
+import re
+from typing import Any
 
 import pymupdf
 import pytest
@@ -471,3 +473,91 @@ def test_vif_subitems_retain_source_visible_parent_context() -> None:
     assert any(issue["code"] == "parent_identifier_not_read" for issue in table["review_issues"])
     assert table["rows"][0][1:] == ["2 sets", "Main valve soft parts sets", "320,000", "640,000"]
     assert table["rows"][1][1:] == ["2 sets", "Pilot valve soft parts sets", "160,000", "320,000"]
+
+
+ASTERION_TESTER_PDF = Path.home() / "Downloads" / "Asterion_Ship_Suppliers_Invoice_Test_4P_Final.pdf"
+
+
+@pytest.mark.skipif(not ASTERION_TESTER_PDF.exists(), reason="local Asterion tester PDF is not present in Downloads")
+def test_asterion_digital_and_scanned_pages_keep_line_item_columns_aligned() -> None:
+    document = pymupdf.open(ASTERION_TESTER_PDF)
+    try:
+        assert len(document) == 4
+        page_tables: list[dict[str, Any]] = []
+        page_results: list[dict[str, Any]] = []
+        for page_index, source_page in enumerate(document):
+            has_native_text = bool(source_page.get_text("text").strip())
+            page = source_page if has_native_text else run_ocr_for_page(source_page, dpi=150)
+            result = extract_tables_from_page(page)
+            page_results.append(result)
+            table = next(
+                item for item in result["tables"]
+                if item.get("table_role") == "line_items" and item.get("column_count") == 6
+            )
+            page_tables.append(table)
+            assert table["headers"] == ["S.NO", "DESCRIPTION", "UNIT", "QTY", "RATE", "AMT"]
+            assert table["column_count"] == 6
+            assert table["row_count"] == (16 if page_index in {0, 2} else 13)
+            if page_index >= 2:
+                assert len(table["cell_ocr_data"]) == table["row_count"]
+                assert all(len(row) == 6 for row in table["cell_ocr_data"])
+                assert all(
+                    "raw_text" in cell and "confidence" in cell and "status" in cell
+                    for row in table["cell_ocr_data"] for cell in row
+                )
+    finally:
+        document.close()
+
+    def keyed_rows(table: dict[str, Any]) -> dict[str, list[str]]:
+        keyed: dict[str, list[str]] = {}
+        for row in table["rows"]:
+            match = re.match(r"\s*(\d+)", str(row[0]))
+            assert match is not None
+            item_number = match.group(1)
+            assert item_number not in keyed
+            assert str(row[0]).strip().rstrip(".") == item_number
+            keyed[item_number] = row
+        return keyed
+
+    for digital_table, scanned_table in zip(page_tables[:2], page_tables[2:]):
+        digital_rows = keyed_rows(digital_table)
+        scanned_rows = keyed_rows(scanned_table)
+        assert scanned_rows.keys() == digital_rows.keys()
+        scan_row_indexes = {
+            str(re.match(r"\s*(\d+)", str(row[0])).group(1)): row_index
+            for row_index, row in enumerate(scanned_table["rows"])
+        }
+        for item_number, digital_row in digital_rows.items():
+            scanned_row = scanned_rows[item_number]
+            assert len(scanned_row) == len(digital_row) == 6
+            # Description transcription can contain ordinary OCR substitutions;
+            # structured values must stay aligned. A missed scan mark may remain
+            # blank only when the exact cell is explicitly marked for review.
+            row_index = scan_row_indexes[item_number]
+            cell_flags = scanned_table.get("cell_review_flags", [])[row_index]
+            for column_index in range(2, 6):
+                if scanned_row[column_index] == digital_row[column_index]:
+                    continue
+                assert scanned_row[column_index] == "", item_number
+                assert cell_flags[column_index], item_number
+
+    digital_total = [
+        (str(cell), str(row[index + 1]))
+        for table in page_results[1]["tables"]
+        for row in table.get("rows", [])
+        for index, cell in enumerate(row[:-1])
+        if "TOTAL AMOUNT USD" in str(cell).upper()
+    ]
+    scanned_total = [
+        (item["label"], item["value"])
+        for item in page_results[3]["summary_items"]
+        if "TOTAL AMOUNT" in item.get("label", "").upper()
+    ]
+    assert any("TOTAL AMOUNT USD" in label.upper() and value == "1,582.66" for label, value in digital_total)
+    assert ("TOTAL AMOUNT USD", "1,582.66") in scanned_total
+    assert "TOTAL AMOUNT" not in str(page_tables[3]["rows"][-1][1]).upper()
+
+    page_three_context = " ".join(
+        str(row.get("text", "")) for row in page_tables[2].get("context_rows", [])
+    )
+    assert "CONTINUED ON NEXT PAGE" in page_three_context

@@ -5,6 +5,7 @@ import pymupdf
 from backend.services.document_parser import (
     _page_image_coverage,
     _page_image_info_for_classification,
+    _page_text_image_overlap,
 )
 from backend.services.page_classifier import classify_page_source
 
@@ -145,6 +146,32 @@ def test_inline_scan_with_text_layer_keeps_bbox_coverage_for_classification():
             has_extractable_text=True,
             image_count=image_count,
             image_coverage=coverage,
+        ) == "scan_with_text_layer"
+    finally:
+        document.close()
+
+
+def test_rotated_scan_with_text_layer_uses_consistent_page_coordinates():
+    document = pymupdf.open()
+    try:
+        page = document.new_page(width=200, height=300)
+        pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 200, 300))
+        pixmap.clear_with(255)
+        page.insert_image(page.rect, pixmap=pixmap)
+        page.insert_text((30, 40), "hidden OCR text", fontsize=8)
+        page.set_rotation(270)
+
+        image_count, image_info = _page_image_info_for_classification(page)
+        coverage = _page_image_coverage(page, image_count, image_info)
+        overlap = _page_text_image_overlap(page, image_info)
+
+        assert coverage >= 0.99
+        assert overlap is not None and overlap >= 0.99
+        assert classify_page_source(
+            has_extractable_text=True,
+            image_count=image_count,
+            image_coverage=coverage,
+            text_image_overlap=overlap,
         ) == "scan_with_text_layer"
     finally:
         document.close()
